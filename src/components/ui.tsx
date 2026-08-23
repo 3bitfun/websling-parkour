@@ -172,6 +172,11 @@ export function Hud({ hud }: { hud: HudData }) {
             </span>
           </div>
         </div>
+        {(hud.sliding || hud.gliding) && (
+          <div key={hud.sliding ? "s" : "g"} className="anim-pop w-fit px-4 py-1 font-display text-lg tracking-widest text-outline-thin" style={{ background: hud.sliding ? "rgba(82,255,168,0.16)" : "rgba(53,224,255,0.14)", border: `2px solid ${hud.sliding ? "#52ffa8" : "#35e0ff"}`, color: hud.sliding ? "#52ffa8" : "#aef3ff", transform: "skewX(-6deg)" }}>
+            {hud.sliding ? "SLIDING" : "GLIDING"}
+          </div>
+        )}
       </div>
 
       {/* right column: timer / tokens / leaderboard / mute */}
@@ -255,24 +260,42 @@ export function Hud({ hud }: { hud: HudData }) {
           <div className="mt-1 h-1.5 bg-ink border border-web/30 overflow-hidden">
             <div className="h-full bg-punch/80 transition-[width] duration-100" style={{ width: `${altPct * 100}%` }} />
           </div>
+          <div className="flex items-center justify-between mt-1.5">
+            <span className="text-[10px] font-bold tracking-[0.25em] text-web/80">DASH [F]</span>
+            <div
+              className={`w-3 h-3 rotate-45 border transition-all duration-150 ${
+                hud.dashReady
+                  ? "bg-mint border-mint shadow-[0_0_10px_rgba(82,255,168,0.9)]"
+                  : "border-web/30 scale-90"
+              }`}
+            />
+          </div>
         </div>
       </div>
 
       {/* contextual hint */}
       <div className="absolute bottom-5 left-1/2 -translate-x-1/2 text-center">
         <div
-          key={`${hud.attached}-${hud.speed > 2 ? "a" : "b"}`}
-          className="anim-rise font-display text-xl tracking-wider text-outline-thin"
-          style={{ color: hud.attached ? "#ffcf3f" : "rgba(174,243,255,0.85)" }}
+          key={hud.attached ? "a" : hud.gliding ? "g" : hud.sliding ? "s" : hud.speed > 2 ? "m" : "i"}
+          className="anim-rise font-display text-xl tracking-wider text-outline-thin whitespace-nowrap"
+          style={{ color: hud.attached ? "#ffcf3f" : hud.gliding ? "#52ffa8" : "rgba(174,243,255,0.85)" }}
         >
-          {hud.attached ? "RELEASE TO FLY!" : "HOLD LMB / SPACE — SHOOT A WEB"}
+          {hud.attached
+            ? "RELEASE TO FLY!"
+            : hud.gliding
+              ? "GLIDING — SOFT LANDING SAVES YOUR COMBO"
+              : hud.sliding
+                ? "SPACE OUT OF THE SLIDE!"
+                : hud.speed > 2
+                  ? "LMB / Q WEB · RMB / E GLIDE"
+                  : "SHIFT RUN · CTRL SLIDE · SPACE JUMP · F DASH"}
         </div>
       </div>
 
       {/* mini controls */}
       <div className="absolute bottom-5 right-4 flex flex-col gap-1 text-[10px] text-web/70 font-semibold tracking-wider text-right">
-        <div><span className="text-white/80">WASD</span> STEER · <span className="text-white/80">SHIFT</span> SPRINT</div>
-        <div><span className="text-white/80">RMB</span> AIR BRAKE · <span className="text-white/80">R</span> RESET · <span className="text-white/80">P</span> PAUSE</div>
+        <div><span className="text-white/80">SHIFT</span> RUN · <span className="text-white/80">CTRL/C</span> SLIDE · <span className="text-white/80">F</span> DASH</div>
+        <div><span className="text-white/80">LMB/Q</span> SWING · <span className="text-white/80">RMB/E</span> GLIDE · <span className="text-white/80">R</span> RESET · <span className="text-white/80">P</span> PAUSE</div>
       </div>
     </div>
   );
@@ -367,12 +390,15 @@ export function StartScreen({ best, onMode }: { best: number; onMode: (m: Mode) 
             <span className="anim-bob inline-block">
               <SpiderGlyph className="w-10 h-10 md:w-14 md:h-14 text-spidey drop-shadow-[0_0_14px_rgba(255,36,56,0.7)]" />
             </span>
-            <span className="font-display text-[min(10vw,96px)] text-spidey text-outline" style={{ textShadow: "6px 6px 0 #35e0ff, 12px 12px 0 rgba(7,11,34,0.85)" }}>
-              WEB RUNNER
+            <span className="font-display text-[min(9vw,88px)] leading-[0.85] text-spidey text-outline" style={{ textShadow: "6px 6px 0 #35e0ff, 12px 12px 0 rgba(7,11,34,0.85)", transform: "rotate(-2deg)" }}>
+              WEBSLING
+              <span className="block text-web" style={{ textShadow: "6px 6px 0 #ff2438, 12px 12px 0 rgba(7,11,34,0.85)", marginLeft: "0.28em" }}>
+                PARKOUR
+              </span>
             </span>
           </div>
-          <div className="mt-1 ml-0.5 font-display text-[min(2.6vw,21px)] tracking-[0.38em] text-web text-outline-thin">
-            3D WEB-SLINGING PATROL
+          <div className="mt-2 ml-0.5 font-display text-[min(2.4vw,20px)] tracking-[0.42em] text-gold text-outline-thin">
+            SWING · SLIDE · DASH · GLIDE
           </div>
         </div>
 
@@ -382,7 +408,7 @@ export function StartScreen({ best, onMode }: { best: number; onMode: (m: Mode) 
           <ModeRow
             n="01"
             title="PATROL SHIFT"
-            desc="Snag 20 tokens before the 2:00 clock runs dry. Land and your combo dies."
+            desc="Snag 20 tokens before the 2:00 clock runs dry. Land hard and your combo dies — glide down to save it."
             accent="#ff2438"
             delay={0.1}
             onClick={() => onMode("solo")}
@@ -408,10 +434,12 @@ export function StartScreen({ best, onMode }: { best: number; onMode: (m: Mode) 
         {/* footer strip */}
         <div className="anim-rise mt-9 flex flex-wrap items-center gap-x-8 gap-y-3" style={{ animationDelay: "0.4s" }}>
           <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 text-[10px] text-web/70 font-semibold tracking-wider">
-            <span><span className="key-cap">HOLD LMB</span> WEB</span>
-            <span><span className="key-cap">RELEASE</span> FLY</span>
-            <span><span className="key-cap">WASD</span> STEER</span>
-            <span><span className="key-cap">SHIFT</span> SPRINT</span>
+            <span><span className="key-cap">LMB</span> / <span className="key-cap">Q</span> WEB</span>
+            <span><span className="key-cap">SPACE</span> JUMP</span>
+            <span><span className="key-cap">CTRL</span> / <span className="key-cap">C</span> SLIDE</span>
+            <span><span className="key-cap">SHIFT</span> RUN</span>
+            <span><span className="key-cap">F</span> DASH</span>
+            <span><span className="key-cap">RMB</span> / <span className="key-cap">E</span> GLIDE</span>
             <span><span className="key-cap">P</span> PAUSE</span>
           </div>
           {best > 0 && (

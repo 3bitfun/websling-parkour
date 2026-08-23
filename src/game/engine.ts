@@ -37,6 +37,9 @@ export interface HudData {
   countdown: number;
   standings: Standing[];
   roomCode: string | null;
+  sliding: boolean;
+  gliding: boolean;
+  dashReady: boolean;
 }
 
 export interface PopupData {
@@ -256,6 +259,24 @@ export class Engine {
   private braking = false;
   private locked = false;
 
+  // parkour movement
+  private jumpBufT = 0;
+  private jumpCut = false;
+  private coyoteT = 0;
+  private slideHeld = false;
+  private sliding = false;
+  private slideT = 0;
+  private slideCool = 0;
+  private glideHeld = false;
+  private gliding = false;
+  private dashCd = 0;
+  private dashT = 0;
+  private refireT = 0;
+  private camSlide = 0;
+  private camGlide = 0;
+  private glider!: THREE.Group;
+  private gliderS = 0;
+
   // scene objects
   private player!: THREE.Group;
   private rig!: Rig;
@@ -309,7 +330,12 @@ export class Engine {
       this.camera.updateProjectionMatrix();
     };
     this.onKeyDown = (e) => this.keyDown(e);
-    this.onKeyUp = (e) => this.keys.delete(e.code);
+    this.onKeyUp = (e) => {
+      this.keys.delete(e.code);
+      if (e.code === "Space") this.jumpCut = true;
+      if (e.code === "ControlLeft" || e.code === "ControlRight" || e.code === "KeyC") this.slideHeld = false;
+      if (e.code === "KeyE") this.glideHeld = false;
+    };
     this.onMouseMove = (e) => {
       if (!this.locked || this.phase !== "playing") return;
       this.yaw -= e.movementX * 0.0023;
@@ -319,14 +345,15 @@ export class Engine {
       if (this.phase !== "playing") return;
       if (e.button === 0) {
         this.mouseWeb = true;
+        this.refireT = 0;
         this.tryWeb();
-      } else if (e.button === 2) this.braking = true;
+      } else if (e.button === 2) this.glideHeld = true;
     };
     this.onMouseUp = (e) => {
       if (e.button === 0) {
         this.mouseWeb = false;
         if (this.attached) this.detach(true);
-      } else if (e.button === 2) this.braking = false;
+      } else if (e.button === 2) this.glideHeld = false;
     };
     this.onLockChange = () => {
       this.locked = document.pointerLockElement === this.canvas;
@@ -453,14 +480,58 @@ export class Engine {
     this.player = this.rig.group;
     this.scene.add(this.player);
 
+    // deployable web-chute (glide parachute)
+    const glider = new THREE.Group();
+    const canopyGeo = new THREE.ConeGeometry(1.75, 0.72, 12, 1, true);
+    const canopy = new THREE.Mesh(
+      canopyGeo,
+      new THREE.MeshBasicMaterial({
+        color: 0xaef3ff,
+        transparent: true,
+        opacity: 0.16,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    const ribs = new THREE.Mesh(
+      canopyGeo,
+      new THREE.MeshBasicMaterial({ color: 0x35e0ff, wireframe: true, transparent: true, opacity: 0.6, depthWrite: false })
+    );
+    const rim = new THREE.Mesh(
+      new THREE.TorusGeometry(1.75, 0.035, 6, 26),
+      new THREE.MeshBasicMaterial({ color: 0xf2fbff, transparent: true, opacity: 0.85 })
+    );
+    rim.rotation.x = Math.PI / 2;
+    rim.position.y = -0.36;
+    const tip = new THREE.Mesh(
+      new THREE.SphereGeometry(0.09, 8, 8),
+      new THREE.MeshBasicMaterial({ color: 0xf2fbff })
+    );
+    tip.position.y = 0.36;
+    glider.add(canopy, ribs, rim, tip);
+    glider.position.y = 2.6;
+    glider.scale.setScalar(0.001);
+    glider.visible = false;
+    this.player.add(glider);
+    this.glider = glider;
+
     this.blobMat = new THREE.MeshBasicMaterial({ color: 0x02030c, transparent: true, opacity: 0.4, depthWrite: false });
     this.blob = new THREE.Mesh(new THREE.CircleGeometry(0.85, 20), this.blobMat);
     this.blob.rotation.x = -Math.PI / 2;
     this.scene.add(this.blob);
   }
 
-  /** Shared swing / fall / run posing for the player and ghost rigs. */
-  private applyPose(r: Rig, hs: number, velY: number, grounded: boolean, attached: boolean, k: number) {
+  /** Shared swing / glide / slide / fall / run posing for the player and ghost rigs. */
+  private applyPose(
+    r: Rig,
+    hs: number,
+    velY: number,
+    grounded: boolean,
+    attached: boolean,
+    k: number,
+    sliding = false,
+    gliding = false
+  ) {
     let armX = 0.15;
     let armZL = 0.12;
     let armZR = -0.12;
@@ -473,6 +544,20 @@ export class Engine {
       armZR = -0.25;
       legX = 0.55 + Math.sin(this.elapsed * 9) * 0.12;
       legZ = 0.22;
+    } else if (gliding && !grounded) {
+      // spread-eagle under the web chute
+      armX = -0.25;
+      armZL = 1.85;
+      armZR = -1.85;
+      legX = 0.25 + Math.sin(this.elapsed * 5) * 0.05;
+      legZ = 0.6;
+    } else if (sliding && grounded) {
+      // low crouch slide — legs kicked forward, arms swept back
+      armX = 0.95;
+      armZL = 0.75;
+      armZR = -0.75;
+      legX = 1.15;
+      legZ = 0.16;
     } else if (!grounded) {
       const fall = velY < -6;
       armX = fall ? -0.9 : -1.5;
@@ -559,6 +644,10 @@ export class Engine {
 
   pause() {
     if (this.phase !== "playing") return;
+    this.keys.clear();
+    this.mouseWeb = false;
+    this.glideHeld = false;
+    this.slideHeld = false;
     this.setPhase("paused");
     if (document.pointerLockElement === this.canvas) document.exitPointerLock();
   }
@@ -637,6 +726,24 @@ export class Engine {
     this.countdown = 3.0;
     this.placement = 1;
     this.finalStandings = [];
+    this.jumpBufT = 0;
+    this.jumpCut = false;
+    this.coyoteT = 0;
+    this.slideHeld = false;
+    this.sliding = false;
+    this.slideT = 0;
+    this.slideCool = 0;
+    this.glideHeld = false;
+    this.gliding = false;
+    this.dashCd = 0;
+    this.dashT = 0;
+    this.camSlide = 0;
+    this.camGlide = 0;
+    this.gliderS = 0;
+    if (this.glider) this.glider.visible = false;
+    this.player.scale.set(1, 1, 1);
+    this.keys.clear();
+    this.mouseWeb = false;
     // in versus, jitter spawns so rivals don't all drop on the same manhole
     if (this.mode === "versus") {
       let h = 0;
@@ -664,8 +771,21 @@ export class Engine {
 
   private keyDown(e: KeyboardEvent) {
     if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
+    if (e.ctrlKey && (e.code === "KeyC" || e.code === "KeyW" || e.code === "KeyR") && this.phase === "playing") e.preventDefault();
     this.keys.add(e.code);
-    if (e.code === "Space" && this.phase === "playing" && !e.repeat) this.tryWeb();
+    if (this.phase === "playing") {
+      if (e.code === "Space" && !e.repeat) this.jumpBufT = 0.14;
+      if ((e.code === "KeyQ") && !e.repeat) {
+        if (this.attached) this.detach(true);
+        else this.tryWeb();
+      }
+      if (e.code === "ControlLeft" || e.code === "ControlRight" || e.code === "KeyC") {
+        this.slideHeld = true;
+        if (!e.repeat) this.trySlide();
+      }
+      if (e.code === "KeyF" && !e.repeat) this.tryDash();
+      if (e.code === "KeyE") this.glideHeld = true;
+    }
     if (e.code === "KeyM" && !e.repeat) this.toggleMute();
     if (e.code === "KeyR" && this.phase === "playing" && !e.repeat) {
       this.pos.copy(this.city.spawn).setY(R + 0.1);
@@ -741,8 +861,60 @@ export class Engine {
     this.particles.burst(this.pos, 6, ["#35e0ff", "#aef3ff"], 5, 0.4);
   }
 
+  private trySlide() {
+    if (this.phase !== "playing" || this.countdown > 0) return;
+    if (this.grounded && !this.sliding && this.slideCool <= 0 && Math.hypot(this.vel.x, this.vel.z) > 8) {
+      this.sliding = true;
+      this.slideT = 0;
+      const hs = Math.hypot(this.vel.x, this.vel.z);
+      const boost = 1 + Math.min(0.35, 4 / Math.max(hs, 1));
+      this.vel.x *= boost;
+      this.vel.z *= boost;
+      this.sfx.slide();
+      this.particles.burst(
+        _v.set(this.pos.x, this.pos.y - R + 0.15, this.pos.z),
+        12,
+        ["#8a93b8", "#aab3d4", "#5b6488"],
+        5,
+        0.5,
+        2
+      );
+    }
+  }
+
+  private tryDash() {
+    if (this.phase !== "playing" || this.countdown > 0 || this.dashCd > 0) return;
+    const fwdH = _f.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+    const rightH = _t.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
+    const dir = new THREE.Vector3();
+    if (this.keys.has("KeyW")) dir.add(fwdH);
+    if (this.keys.has("KeyS")) dir.sub(fwdH);
+    if (this.keys.has("KeyD")) dir.add(rightH);
+    if (this.keys.has("KeyA")) dir.sub(rightH);
+    if (dir.lengthSq() === 0) dir.copy(fwdH);
+    dir.normalize();
+    this.vel.x = dir.x * 34;
+    this.vel.z = dir.z * 34;
+    if (this.grounded) this.vel.y = Math.max(this.vel.y, 2.4);
+    this.sliding = false;
+    this.dashCd = 0.9;
+    this.dashT = 0.18;
+    this.fovPunch = Math.max(this.fovPunch, 4.5);
+    this.shake = Math.min(1, this.shake + 0.18);
+    this.sfx.dash();
+    this.particles.burst(this.pos, 16, ["#aef3ff", "#35e0ff", "#ffffff"], 9, 0.42, 3);
+    this.popupAt(_v.set(this.pos.x, this.pos.y + 1.2, this.pos.z), "DASH!", "cyan");
+  }
+
   /* ---------------- physics ---------------- */
   private step(h: number) {
+    // parkour timers
+    this.jumpBufT = Math.max(0, this.jumpBufT - h);
+    this.coyoteT = this.grounded ? 0.12 : Math.max(0, this.coyoteT - h);
+    this.slideCool = Math.max(0, this.slideCool - h);
+    this.dashCd = Math.max(0, this.dashCd - h);
+    this.dashT = Math.max(0, this.dashT - h);
+
     const fwdH = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
     const rightH = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
     const wish = new THREE.Vector3();
@@ -752,21 +924,97 @@ export class Engine {
     if (this.keys.has("KeyA")) wish.sub(rightH);
     if (wish.lengthSq() > 0) wish.normalize();
 
+    const hs0 = Math.hypot(this.vel.x, this.vel.z);
+
+    // ---- slide state machine ----
+    if (this.sliding) {
+      this.slideT += h;
+      if (!this.grounded || this.slideT > 1.15 || (!this.slideHeld && this.slideT > 0.3) || hs0 < 4.5) {
+        this.sliding = false;
+        this.slideCool = 0.45;
+      }
+    } else if (this.slideHeld && this.grounded && this.slideCool <= 0 && hs0 > 8) {
+      this.sliding = true;
+      this.slideT = 0;
+      const boost = 1 + Math.min(0.35, 4 / Math.max(hs0, 1));
+      this.vel.x *= boost;
+      this.vel.z *= boost;
+      this.sfx.slide();
+      this.particles.burst(
+        _v.set(this.pos.x, this.pos.y - R + 0.15, this.pos.z),
+        12,
+        ["#8a93b8", "#aab3d4", "#5b6488"],
+        5,
+        0.5,
+        2
+      );
+    }
+
+    // ---- jump (buffered + coyote, variable height) ----
+    if (this.jumpBufT > 0 && (this.grounded || this.coyoteT > 0)) {
+      this.sliding = false;
+      this.vel.y = 14.6;
+      this.grounded = false;
+      this.coyoteT = 0;
+      this.jumpBufT = 0;
+      this.sfx.jump();
+      this.particles.burst(
+        _v.set(this.pos.x, this.pos.y - R + 0.1, this.pos.z),
+        7,
+        ["#aef3ff", "#ffffff"],
+        3.4,
+        0.35,
+        1.6
+      );
+    }
+    if (this.jumpCut) {
+      this.jumpCut = false;
+      if (this.vel.y > 5 && !this.grounded) this.vel.y *= 0.55;
+    }
+
+    // ---- glide / parachute (air) & brake (ground) ----
+    this.gliding = false;
+    if (this.glideHeld && !this.grounded) {
+      if (this.attached) this.detach(false);
+      this.gliding = true;
+      this.sliding = false;
+    }
+
     if (this.grounded) {
-      this.vel.addScaledVector(wish, 48 * h);
-      const damp = wish.lengthSq() > 0 ? 2.2 : 9;
-      this.vel.x *= Math.exp(-damp * h);
-      this.vel.z *= Math.exp(-damp * h);
-      const cap = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight") ? 26 : 15;
-      const hs = Math.hypot(this.vel.x, this.vel.z);
-      if (hs > cap) {
-        this.vel.x *= cap / hs;
-        this.vel.z *= cap / hs;
+      if (this.glideHeld) {
+        // hard brake
+        const f = Math.exp(-3.4 * h);
+        this.vel.x *= f;
+        this.vel.z *= f;
+      } else if (this.sliding) {
+        // low-friction slide with light steering
+        this.vel.addScaledVector(wish, 11 * h);
+        const f = Math.exp(-0.45 * h);
+        this.vel.x *= f;
+        this.vel.z *= f;
+      } else if (this.dashT <= 0) {
+        this.vel.addScaledVector(wish, 48 * h);
+        const damp = wish.lengthSq() > 0 ? 2.2 : 9;
+        this.vel.x *= Math.exp(-damp * h);
+        this.vel.z *= Math.exp(-damp * h);
+        const cap = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight") ? 26 : 15;
+        const hs = Math.hypot(this.vel.x, this.vel.z);
+        if (hs > cap) {
+          this.vel.x *= cap / hs;
+          this.vel.z *= cap / hs;
+        }
       }
     } else {
-      this.vel.addScaledVector(wish, 21 * h);
+      this.vel.addScaledVector(wish, (this.gliding ? 30 : 21) * h);
+      if (this.gliding) {
+        // canopy physics: soft drag + clamped fall speed
+        const f = Math.exp(-0.85 * h);
+        this.vel.x *= f;
+        this.vel.z *= f;
+        if (this.vel.y < -5.5) this.vel.y = -5.5;
+      }
       const hs = Math.hypot(this.vel.x, this.vel.z);
-      const cap = this.attached ? 62 : 55;
+      const cap = this.attached ? 62 : this.dashT > 0 ? 70 : 55;
       if (hs > cap) {
         this.vel.x *= cap / hs;
         this.vel.z *= cap / hs;
@@ -777,10 +1025,6 @@ export class Engine {
       this.attachT += h;
       this.ropeLen = Math.max(7, this.ropeLen - 6.5 * h);
       this.vel.addScaledVector(fwdH, 23 * h);
-    }
-    if (this.braking) {
-      const f = Math.exp(-2.4 * h);
-      this.vel.multiplyScalar(f);
     }
 
     this.vel.y -= GRAV * h;
@@ -871,16 +1115,24 @@ export class Engine {
 
   private land(fallV: number) {
     if (this.attached && this.attachT > 0.2) this.detach(false);
-    if (fallV < -15) {
-      this.sfx.thud(true);
-      this.shake = Math.min(1.4, this.shake + -fallV / 45);
-      this.particles.burst(this.pos.clone().setY(this.pos.y - R + 0.2), 16, ["#8a93b8", "#5b6488", "#aab3d4"], 7, 0.6, 3);
-    } else if (fallV < -6) {
+    const soft = this.gliding;
+    if (soft) {
+      // parachute touchdown — gentle, and it protects the combo
       this.sfx.thud(false);
-      this.particles.burst(this.pos.clone().setY(this.pos.y - R + 0.2), 8, ["#6a739a", "#8a93b8"], 4, 0.45, 2);
+      this.particles.burst(this.pos.clone().setY(this.pos.y - R + 0.2), 10, ["#aef3ff", "#8a93b8"], 3.4, 0.5, 2);
+      if (this.combo >= 2) this.popupAt(_v.set(this.pos.x, this.pos.y + 1.4, this.pos.z), "COMBO SAVED", "cyan");
+    } else {
+      if (fallV < -15) {
+        this.sfx.thud(true);
+        this.shake = Math.min(1.4, this.shake + -fallV / 45);
+        this.particles.burst(this.pos.clone().setY(this.pos.y - R + 0.2), 16, ["#8a93b8", "#5b6488", "#aab3d4"], 7, 0.6, 3);
+      } else if (fallV < -6) {
+        this.sfx.thud(false);
+        this.particles.burst(this.pos.clone().setY(this.pos.y - R + 0.2), 8, ["#6a739a", "#8a93b8"], 4, 0.45, 2);
+      }
+      if (this.combo > 0) this.popupAt(this.pos, "COMBO LOST", "red");
+      this.combo = 0;
     }
-    if (this.combo > 0) this.popupAt(this.pos, "COMBO LOST", "red");
-    this.combo = 0;
   }
 
   /* ---------------- per-frame ---------------- */
@@ -902,7 +1154,11 @@ export class Engine {
           this.acc -= STEP;
         }
         this.cooldown = Math.max(0, this.cooldown - dt);
-        if (this.mouseWeb && !this.attached && this.cooldown <= 0 && this.elapsed % 1 < 0.5) this.tryWeb();
+        this.refireT = Math.max(0, this.refireT - dt);
+        if (this.mouseWeb && !this.attached && this.cooldown <= 0 && this.refireT <= 0) {
+          this.tryWeb();
+          this.refireT = 0.3;
+        }
 
         // timer (frozen in free play)
         if (this.mode !== "free") {
@@ -999,7 +1255,55 @@ export class Engine {
     while (dy < -Math.PI) dy += Math.PI * 2;
     this.player.rotation.y += dy * k;
 
-    this.applyPose(this.rig, hs, this.vel.y, this.grounded, this.attached, k);
+    this.applyPose(this.rig, hs, this.vel.y, this.grounded, this.attached, k, this.sliding, this.gliding);
+
+    // slide squash & stretch
+    const targetY = this.sliding ? 0.58 : 1;
+    const targetXZ = this.sliding ? 1.12 : 1;
+    this.player.scale.y += (targetY - this.player.scale.y) * k;
+    this.player.scale.x += (targetXZ - this.player.scale.x) * k;
+    this.player.scale.z = this.player.scale.x;
+
+    // slide dust trail
+    if (this.sliding && speed > 6) {
+      this.trailAcc += dt * 40;
+      if (this.trailAcc > 1) {
+        this.trailAcc = 0;
+        this.particles.burst(
+          _v.set(this.pos.x - this.vel.x * 0.05, this.pos.y - R + 0.12, this.pos.z - this.vel.z * 0.05),
+          2,
+          ["#8a93b8", "#aab3d4"],
+          2.2,
+          0.4,
+          1.4
+        );
+      }
+    }
+
+    // web-chute deploy animation
+    const gTarget = this.gliding ? 1 : 0.001;
+    this.gliderS += (gTarget - this.gliderS) * (1 - Math.exp(-(this.gliding ? 15 : 20) * dt));
+    this.glider.visible = this.gliderS > 0.02;
+    if (this.glider.visible) {
+      const s = this.gliderS * (this.gliding ? 1 + Math.sin(this.elapsed * 11) * 0.02 : 1);
+      this.glider.scale.set(s, s * 0.94, s);
+      this.glider.rotation.z = Math.sin(this.elapsed * 2.6) * 0.09 * this.gliderS;
+      this.glider.rotation.x = THREE.MathUtils.clamp(this.vel.y * 0.014, -0.28, 0.3) * this.gliderS;
+      if (this.gliding) {
+        this.trailAcc += dt * 26;
+        if (this.trailAcc > 1) {
+          this.trailAcc = 0;
+          this.particles.burst(
+            _v.set(this.pos.x, this.pos.y - R - 0.4, this.pos.z),
+            1,
+            ["#aef3ff"],
+            1.1,
+            0.6,
+            0.6
+          );
+        }
+      }
+    }
 
     // blob shadow on highest surface below
     let surfY = 0;
@@ -1062,10 +1366,20 @@ export class Engine {
       look.y += (this.anchor.y - this.pos.y) * 0.05;
       look.z += (this.anchor.z - this.pos.z) * 0.09;
     }
+
+    // slide duck-cam & glide pull-back smoothing
+    this.camSlide += ((this.sliding ? 1 : 0) - this.camSlide) * (1 - Math.exp(-10 * dt));
+    this.camGlide += ((this.gliding ? 1 : 0) - this.camGlide) * (1 - Math.exp(-8 * dt));
+    look.y -= this.camSlide * 0.55;
+
     this.camLook.lerp(look, 1 - Math.exp(-10 * dt));
 
     // distance: pulls back as you speed up for a wider, faster frame
-    const distT = THREE.MathUtils.clamp(8.8 + speed * 0.09, 8.8, 15.5) + (this.attached ? 0.7 : 0);
+    const distT =
+      THREE.MathUtils.clamp(8.8 + speed * 0.09, 8.8, 15.5) +
+      (this.attached ? 0.7 : 0) -
+      this.camSlide * 1.2 +
+      this.camGlide * 1.1;
     this.camDist += (distT - this.camDist) * (1 - Math.exp(-5 * dt));
 
     // ideal position behind the look target; looking up sinks it, looking down lifts it
@@ -1113,7 +1427,8 @@ export class Engine {
 
     // FOV: speed rush + thwip punch-in / release punch-out
     this.fovPunch *= Math.exp(-7 * dt);
-    const targetFov = 72 + Math.min(26, Math.max(0, speed - 10) * 0.62) + (this.attached ? 2 : 0) + this.fovPunch;
+    const targetFov =
+      72 + Math.min(26, Math.max(0, speed - 10) * 0.62) + (this.attached ? 2 : 0) - this.camGlide * 3 + this.fovPunch;
     this.fov += (targetFov - this.fov) * (1 - Math.exp(-6 * dt));
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
@@ -1448,6 +1763,9 @@ export class Engine {
       countdown: this.countdown,
       standings: this.mode === "versus" ? this.rosterCache.slice(0, 5) : [],
       roomCode: this.roomCode,
+      sliding: this.sliding,
+      gliding: this.gliding,
+      dashReady: this.dashCd <= 0,
     });
   }
 }

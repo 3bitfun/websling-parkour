@@ -29,6 +29,9 @@ const initialHud: HudData = {
   countdown: 0,
   standings: [],
   roomCode: null,
+  sliding: false,
+  gliding: false,
+  dashReady: true,
 };
 
 export default function App() {

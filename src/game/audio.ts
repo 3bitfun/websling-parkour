@@ -107,6 +107,22 @@ export class Sfx {
     this.tone(240, 0.16, "triangle", 0.18, 620);
   }
 
+  slide() {
+    this.noise(0.34, 1600, 0.24, 1.4, 420);
+    this.tone(300, 0.2, "triangle", 0.1, 130);
+  }
+
+  dash() {
+    this.noise(0.22, 900, 0.32, 1.6, 5200);
+    this.tone(420, 0.14, "sawtooth", 0.12, 1250);
+  }
+
+  glide() {
+    // parachute "fwump" — lowpass noise swell + soft pop
+    this.noise(0.4, 500, 0.3, 1, 2600);
+    this.tone(140, 0.18, "sine", 0.22, 60, 0.05);
+  }
+
   ui() {
     this.tone(760, 0.07, "square", 0.12);
     this.tone(1140, 0.09, "square", 0.1, undefined, 0.05);
