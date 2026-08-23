@@ -38,7 +38,11 @@ The dev server starts on `http://localhost:3000`.
 npm run build
 ```
 
-Output goes to `dist/`. The base path is set to `/doodl/` in `vite.config.js` — adjust if deploying elsewhere.
+Output goes to `dist/`. The base path is set to `/websling-parkour/` in `vite.config.js` for this repository.
+
+## Deploy to GitHub Pages
+
+Pushes to `main` deploy automatically through `.github/workflows/deploy-pages.yml`. In the repository settings, open **Pages** and set **Source** to **GitHub Actions**.
 
 ## Controls
 
