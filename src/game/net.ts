@@ -44,7 +44,7 @@ const SB_KEY =
 export const SUPABASE_CONFIGURED = SB_URL.length > 0 && SB_KEY.length > 0;
 
 let sharedClient: SupabaseClient | null = null;
-function getClient(): SupabaseClient | null {
+export function getSupabaseClient(): SupabaseClient | null {
   if (!SUPABASE_CONFIGURED) return null;
   try {
     if (!sharedClient) sharedClient = createClient(SB_URL, SB_KEY);
@@ -143,7 +143,7 @@ export function createRoomTransport(
   pid: string,
   onSwap?: (kind: RoomTransport["kind"]) => void
 ): RoomTransport {
-  const client = getClient();
+  const client = getSupabaseClient();
   if (!client) return new LocalTransport(code, pid);
 
   let closed = false;

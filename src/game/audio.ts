@@ -107,6 +107,43 @@ export class Sfx {
     this.tone(240, 0.16, "triangle", 0.18, 620);
   }
 
+  /* ---------- combat ---------- */
+  punchWhiff() {
+    this.noise(0.09, 1800, 0.16, 2, 3200);
+  }
+  punchHit(heavy: boolean) {
+    this.tone(heavy ? 130 : 190, heavy ? 0.16 : 0.11, "sine", heavy ? 0.5 : 0.34, 55);
+    this.noise(0.08, heavy ? 700 : 1100, heavy ? 0.4 : 0.26, 1);
+    this.tone(heavy ? 2400 : 2800, 0.05, "square", 0.1);
+  }
+  grunt() {
+    this.tone(150, 0.18, "sawtooth", 0.14, 90);
+  }
+  lunge() {
+    this.noise(0.16, 900, 0.22, 1.5, 2600);
+    this.tone(220, 0.14, "sawtooth", 0.12, 420);
+  }
+  thugDie() {
+    this.tone(320, 0.3, "square", 0.16, 70);
+    this.noise(0.25, 1600, 0.22, 1, 300);
+    this.tone(640, 0.1, "square", 0.12, 160, 0.05);
+  }
+  hurt() {
+    this.tone(220, 0.22, "sawtooth", 0.22, 80);
+    this.noise(0.14, 500, 0.2, 1);
+  }
+  rockThrow() {
+    this.noise(0.14, 1200, 0.14, 2, 2400);
+  }
+  rockLand() {
+    this.tone(170, 0.09, "sine", 0.2, 60);
+    this.noise(0.06, 900, 0.14, 1);
+  }
+  heal() {
+    this.tone(620, 0.1, "sine", 0.16);
+    this.tone(930, 0.14, "sine", 0.16, undefined, 0.07);
+  }
+
   slide() {
     this.noise(0.34, 1600, 0.24, 1.4, 420);
     this.tone(300, 0.2, "triangle", 0.1, 130);

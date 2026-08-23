@@ -2,6 +2,9 @@ import * as THREE from "three";
 import { City, WORLD_SPAN, type Box } from "./world";
 import { Sfx } from "./audio";
 import { createRoomTransport, randomPid, type NetPacket, type NetStatus, type RoomTransport } from "./net";
+import { BACKEND_READY, onAuthChange, submitScore, type AccountUser } from "./backend";
+import { buildR6Rig, spiderStyle, type Rig } from "./rig";
+import { Crowd, type PunchEvent } from "./npcs";
 
 export type Phase = "menu" | "playing" | "paused" | "won" | "lost";
 export type Mode = "solo" | "free" | "versus";
@@ -40,6 +43,8 @@ export interface HudData {
   sliding: boolean;
   gliding: boolean;
   dashReady: boolean;
+  hp: number;
+  punchCombo: number;
 }
 
 export interface PopupData {
@@ -59,6 +64,8 @@ export interface RunStats {
   mode: Mode;
   placement: number;
   standings: Standing[];
+  ko: boolean;
+  thugsDown: number;
 }
 
 export interface EngineCallbacks {
@@ -67,14 +74,7 @@ export interface EngineCallbacks {
   onPhase: (phase: Phase, stats: RunStats | null) => void;
   onRoster: (list: Standing[]) => void;
   onNetStatus: (s: NetStatus) => void;
-}
-
-interface Rig {
-  group: THREE.Group;
-  armL: THREE.Object3D;
-  armR: THREE.Object3D;
-  legL: THREE.Object3D;
-  legR: THREE.Object3D;
+  onToast?: (msg: string) => void;
 }
 
 interface Ghost extends Rig {
@@ -292,6 +292,24 @@ export class Engine {
   private trailAcc = 0;
   private currentAnchor: { point: THREE.Vector3; sky: boolean } | null = null;
 
+  // backend (accounts / leaderboard)
+  private authUser: AccountUser | null = null;
+  private authUnsub: (() => void) | null = null;
+  private submitted = false;
+
+  // crowd + combat
+  private crowd!: Crowd;
+  private punches: PunchEvent[] = [];
+  private hp = 100;
+  private invulnT = 0;
+  private comboT = 0;
+  private comboCount = 0;
+  private attackAnim = 0;
+  private hitFlash = 0;
+  private punchCooldown = 0;
+  private ko = false;
+  private thugsDown = 0;
+
   private onKeyDown: (e: KeyboardEvent) => void;
   private onKeyUp: (e: KeyboardEvent) => void;
   private onMouseMove: (e: MouseEvent) => void;
@@ -306,6 +324,9 @@ export class Engine {
   constructor(canvas: HTMLCanvasElement, cbs: EngineCallbacks) {
     this.canvas = canvas;
     this.cbs = cbs;
+    this.authUnsub = onAuthChange((u) => {
+      this.authUser = u;
+    });
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
     this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -323,6 +344,7 @@ export class Engine {
     this.buildPlayer();
     this.buildWebLines();
     this.buildTokens();
+    this.crowd = new Crowd(this.scene, this.city);
 
     this.onResize = () => {
       this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -404,79 +426,12 @@ export class Engine {
     return new THREE.CanvasTexture(cv);
   }
 
-  private toonMat(color: number) {
-    const data = new Uint8Array([70, 70, 70, 255, 140, 140, 140, 255, 255, 255, 255, 255]);
-    const grad = new THREE.DataTexture(data, 3, 1, THREE.RGBAFormat);
-    grad.minFilter = THREE.NearestFilter;
-    grad.magFilter = THREE.NearestFilter;
-    grad.needsUpdate = true;
-    return new THREE.MeshToonMaterial({ color, gradientMap: grad });
-  }
-
-  private buildRig(bodyColor: number, accentColor: number): Rig {
-    const g = new THREE.Group();
-    const accent = this.toonMat(accentColor);
-    const body = this.toonMat(bodyColor);
-    const dark = this.toonMat(0x111735);
-
-    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.3, 0.42, 4, 10), body);
-    torso.position.y = 0.98;
-    const chest = new THREE.Mesh(new THREE.CapsuleGeometry(0.315, 0.2, 4, 10), accent);
-    chest.position.y = 1.24;
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.26, 14, 12), accent);
-    head.position.y = 1.68;
-    head.scale.set(0.92, 1.05, 0.95);
-    const eyeGeo = new THREE.SphereGeometry(0.11, 10, 8);
-    const eyeMat = new THREE.MeshBasicMaterial({ color: 0xf4fbff });
-    const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
-    eyeL.scale.set(0.75, 1.15, 0.45);
-    eyeL.position.set(-0.1, 1.71, 0.2);
-    eyeL.rotation.set(0, -0.3, -0.25);
-    const eyeR = eyeL.clone();
-    eyeR.position.x = 0.1;
-    eyeR.rotation.set(0, 0.3, 0.25);
-    const eyeLineL = new THREE.Mesh(eyeGeo, dark);
-    eyeLineL.scale.set(0.85, 1.25, 0.4);
-    eyeLineL.position.set(-0.1, 1.71, 0.185);
-    eyeLineL.rotation.copy(eyeL.rotation);
-    const eyeLineR = eyeLineL.clone();
-    eyeLineR.position.x = 0.1;
-    eyeLineR.rotation.copy(eyeR.rotation);
-
-    const limb = (w: number, l: number, mat: THREE.Material) => {
-      const pivot = new THREE.Group();
-      const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(w, l, 4, 8), mat);
-      mesh.position.y = -(l / 2 + w);
-      pivot.add(mesh);
-      return pivot;
-    };
-    const armL = limb(0.085, 0.42, accent);
-    armL.position.set(-0.4, 1.42, 0);
-    const armR = limb(0.085, 0.42, accent);
-    armR.position.set(0.4, 1.42, 0);
-    const legL = limb(0.105, 0.48, body);
-    legL.position.set(-0.16, 0.82, 0);
-    const legR = limb(0.105, 0.48, body);
-    legR.position.set(0.16, 0.82, 0);
-    const bootGeo = new THREE.SphereGeometry(0.12, 8, 8);
-    const bootL = new THREE.Mesh(bootGeo, accent);
-    bootL.position.y = -0.66;
-    bootL.scale.set(1, 0.8, 1.3);
-    const bootR = bootL.clone();
-    legL.add(bootL);
-    legR.add(bootR);
-
-    // spider emblem
-    const spider = new THREE.Mesh(new THREE.SphereGeometry(0.055, 6, 6), dark);
-    spider.scale.set(1, 1.6, 0.5);
-    spider.position.set(0, 1.3, 0.3);
-
-    g.add(torso, chest, head, eyeLineL, eyeLineR, eyeL, eyeR, spider, armL, armR, legL, legR);
-    return { group: g, armL, armR, legL, legR };
+  private buildSpiderRig(): Rig {
+    return buildR6Rig(spiderStyle());
   }
 
   private buildPlayer() {
-    this.rig = this.buildRig(0x2b53d9, 0xe6273a);
+    this.rig = this.buildSpiderRig();
     this.player = this.rig.group;
     this.scene.add(this.player);
 
@@ -655,6 +610,7 @@ export class Engine {
   toMenu() {
     if (document.pointerLockElement === this.canvas) document.exitPointerLock();
     this.leaveRoom();
+    this.maybeSubmitScore();
     this.resetRun();
     this.player.visible = false;
     this.setPhase("menu");
@@ -670,6 +626,9 @@ export class Engine {
       this.transport.close();
       this.transport = null;
     }
+    this.authUnsub?.();
+    this.authUnsub = null;
+    if (this.crowd) this.crowd.dispose();
     cancelAnimationFrame(this.raf);
     window.removeEventListener("resize", this.onResize);
     window.removeEventListener("keydown", this.onKeyDown);
@@ -700,14 +659,46 @@ export class Engine {
       mode: this.mode,
       placement: this.placement,
       standings: this.finalStandings,
+      ko: this.ko,
+      thugsDown: this.thugsDown,
     };
+  }
+
+  /** Upload the finished run to the websling leaderboard (once per run). */
+  private maybeSubmitScore() {
+    if (this.submitted || !BACKEND_READY || !this.authUser || this.score <= 0) return;
+    this.submitted = true;
+    const s = this.stats();
+    submitScore(this.authUser.id, {
+      mode: s.mode,
+      score: s.score,
+      tokens: s.tokens,
+      maxCombo: s.maxCombo,
+      bestSwing: s.bestSwing,
+      timeLeft: s.timeLeft,
+      placement: s.mode === "versus" && s.placement > 0 ? s.placement : null,
+    })
+      .then(() => this.cbs.onToast?.("SCORE SAVED TO LEADERBOARD"))
+      .catch(() => this.cbs.onToast?.("LEADERBOARD UPLOAD FAILED"));
   }
 
   private resetRun() {
     this.score = 0;
+    this.submitted = false;
     this.combo = 0;
     this.maxCombo = 0;
     this.bestSwing = 0;
+    this.hp = 100;
+    this.ko = false;
+    this.thugsDown = 0;
+    this.invulnT = 0;
+    this.comboCount = 0;
+    this.comboT = 0;
+    this.attackAnim = 0;
+    this.hitFlash = 0;
+    this.punchCooldown = 0;
+    this.punches.length = 0;
+    if (this.crowd) this.crowd.reset();
     this.time = RUN_TIME;
     this.collected = 0;
     this.lastTickSec = -1;
@@ -785,6 +776,7 @@ export class Engine {
       }
       if (e.code === "KeyF" && !e.repeat) this.tryDash();
       if (e.code === "KeyE") this.glideHeld = true;
+      if ((e.code === "KeyV" || e.code === "KeyB") && !e.repeat) this.tryPunch();
     }
     if (e.code === "KeyM" && !e.repeat) this.toggleMute();
     if (e.code === "KeyR" && this.phase === "playing" && !e.repeat) {
@@ -904,6 +896,78 @@ export class Engine {
     this.sfx.dash();
     this.particles.burst(this.pos, 16, ["#aef3ff", "#35e0ff", "#ffffff"], 9, 0.42, 3);
     this.popupAt(_v.set(this.pos.x, this.pos.y + 1.2, this.pos.z), "DASH!", "cyan");
+  }
+
+  /* ---------------- combat ---------------- */
+  private tryPunch() {
+    if (this.phase !== "playing" || this.countdown > 0 || this.punchCooldown > 0) return;
+    this.punchCooldown = 0.34;
+    this.attackAnim = 1;
+    const dir = this.aimDir(new THREE.Vector3());
+    const heavy = !this.grounded;
+    const dmg = heavy ? 55 : 32;
+    this.sfx.punchWhiff();
+    this.punches.push({
+      x: this.pos.x,
+      y: this.pos.y + 0.3,
+      z: this.pos.z,
+      dx: dir.x,
+      dy: dir.y,
+      dz: dir.z,
+      dmg,
+      range: heavy ? 4.2 : 3.4,
+      heavy,
+    });
+  }
+
+  private onPunchHit(heavy: boolean, at: THREE.Vector3) {
+    this.comboCount++;
+    this.comboT = 2.2;
+    const bonus = 40 * Math.min(this.comboCount, 6);
+    this.score += bonus;
+    this.sfx.punchHit(heavy);
+    this.shake = Math.min(1.2, this.shake + (heavy ? 0.4 : 0.22));
+    this.fovPunch = Math.max(this.fovPunch, heavy ? 3 : 1.6);
+    this.particles.burst(at, heavy ? 18 : 10, ["#ffffff", "#ffcf3f", "#ff2438"], heavy ? 9 : 6, 0.5, 2.6);
+    this.popupAt(at, `+${bonus}`, this.comboCount >= 3 ? "gold" : "cyan");
+    if (this.comboCount === 3) this.popupAt(_v.set(at.x, at.y + 1.2, at.z), "COMBO!", "gold");
+  }
+
+  private onThugKilled(at: THREE.Vector3) {
+    const bounty = 250 * Math.max(1, this.combo);
+    this.score += bounty;
+    this.thugsDown++;
+    this.popupAt(at, `+${bounty} BOUNTY`, "gold");
+    this.particles.burst(at, 26, ["#ffcf3f", "#ffffff", "#ff2438"], 11, 1, 3);
+    this.hp = Math.min(100, this.hp + 6);
+  }
+
+  private damagePlayer(n: number, from: THREE.Vector3) {
+    if (this.invulnT > 0 || this.phase !== "playing") return;
+    this.hp = Math.max(0, this.hp - n);
+    this.invulnT = 0.9;
+    this.hitFlash = 1;
+    this.shake = Math.min(1.4, this.shake + 0.5);
+    this.sfx.hurt();
+    const away = _v.set(this.pos.x - from.x, 0, this.pos.z - from.z);
+    if (away.lengthSq() > 0.01) away.normalize().multiplyScalar(13);
+    else away.set(0, 0, 13);
+    this.vel.x += away.x;
+    this.vel.z += away.z;
+    this.vel.y = Math.max(this.vel.y, 7);
+    this.particles.burst(this.pos, 14, ["#ff2438", "#ffffff"], 8, 0.5, 2.6);
+    if (this.hp <= 0) {
+      if (this.mode === "free") {
+        this.hp = 100;
+        this.pos.copy(this.city.spawn).setY(R + 0.1);
+        this.vel.set(0, 0, 0);
+        this.attached = false;
+        this.popupAt(_v.set(this.pos.x, this.pos.y + 2, this.pos.z), "RESPAWN", "cyan");
+      } else {
+        this.ko = true;
+        this.endRun(false);
+      }
+    }
   }
 
   /* ---------------- physics ---------------- */
@@ -1235,6 +1299,30 @@ export class Engine {
     const pulse = 0.55 + 0.45 * Math.sin(this.elapsed * 3.1);
     this.city.beaconMat.color.setRGB(0.55 + pulse * 0.45, 0.1 + pulse * 0.17, 0.16 + pulse * 0.17);
 
+    // crowd + combat
+    if (this.countdown <= 0) {
+      this.invulnT = Math.max(0, this.invulnT - dt);
+      this.punchCooldown = Math.max(0, this.punchCooldown - dt);
+      this.attackAnim = Math.max(0, this.attackAnim - dt * 3.4);
+      this.hitFlash = Math.max(0, this.hitFlash - dt * 3);
+      if (this.comboT > 0) {
+        this.comboT -= dt;
+        if (this.comboT <= 0) this.comboCount = 0;
+      }
+    }
+    this.crowd.update(dt, {
+      active: this.phase === "playing" && this.countdown <= 0,
+      playerPos: this.pos,
+      invuln: this.invulnT > 0,
+      elapsed: this.elapsed,
+      punches: this.punches,
+      damagePlayer: (n, from) => this.damagePlayer(n, from),
+      onPunchHit: (heavy, at) => this.onPunchHit(heavy, at),
+      onThugKilled: (at) => this.onThugKilled(at),
+      particles: this.particles,
+      sfx: this.sfx,
+    });
+
     this.particles.update(dt);
     this.renderer.render(this.scene, this.camera);
 
@@ -1256,6 +1344,22 @@ export class Engine {
     this.player.rotation.y += dy * k;
 
     this.applyPose(this.rig, hs, this.vel.y, this.grounded, this.attached, k, this.sliding, this.gliding);
+
+    // punch animation: snap the striking arm forward
+    if (this.attackAnim > 0 && !this.attached) {
+      const punch = Math.sin(Math.min(1, this.attackAnim) * Math.PI);
+      const arm = this.grounded ? this.rig.armR : this.rig.armL;
+      arm.rotation.x = -1.45 * punch;
+      arm.rotation.z = 0;
+      this.rig.torso.rotation.y = 0.5 * punch * (this.grounded ? 1 : -1);
+    } else {
+      this.rig.torso.rotation.y *= 0.8;
+    }
+
+    // hit flash: briefly tint the rig red when damaged
+    const flash = this.invulnT > 0.6 ? 0.9 : this.hitFlash * 0.7;
+    (this.rig.torso.material as THREE.MeshToonMaterial).emissive.setRGB(flash, flash * 0.1, flash * 0.1);
+    (this.rig.head.material as THREE.MeshToonMaterial).emissive.setRGB(flash * 0.6, 0, 0);
 
     // slide squash & stretch
     const targetY = this.sliding ? 0.58 : 1;
@@ -1549,7 +1653,12 @@ export class Engine {
 
   private createGhost(p: NetPacket): Ghost {
     const col = new THREE.Color(p.color || "#52ffa8");
-    const rig = this.buildRig(col.clone().multiplyScalar(0.55).getHex(), col.getHex());
+    const rig = buildR6Rig({
+      head: col.getHex(),
+      torso: col.clone().multiplyScalar(0.75).getHex(),
+      arms: col.clone().multiplyScalar(0.55).getHex(),
+      legs: col.clone().multiplyScalar(0.55).getHex(),
+    });
     rig.group.traverse((o) => {
       const mesh = o as THREE.Mesh;
       if (mesh.isMesh) {
@@ -1724,6 +1833,7 @@ export class Engine {
     if (document.pointerLockElement === this.canvas) document.exitPointerLock();
     if (won) this.particles.burst(this.pos.clone().add(new THREE.Vector3(0, 3, 0)), 90, ["#ffcf3f", "#35e0ff", "#ff4fd8", "#ffffff"], 16, 1.4, 8);
     this.setPhase(won ? "won" : "lost");
+    this.maybeSubmitScore();
   }
 
   /* ---------------- hud ---------------- */
@@ -1766,6 +1876,8 @@ export class Engine {
       sliding: this.sliding,
       gliding: this.gliding,
       dashReady: this.dashCd <= 0,
+      hp: this.hp,
+      punchCombo: this.comboCount,
     });
   }
 }

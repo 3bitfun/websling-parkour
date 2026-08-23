@@ -1,7 +1,8 @@
-import type { CSSProperties } from "react";
+import { useState, type CSSProperties, type FormEvent } from "react";
 import type { HudData, Mode, PopupData, RunStats, Standing } from "../game/engine";
 import type { NetStatus } from "../game/net";
 import { SUPABASE_CONFIGURED } from "../game/net";
+import type { AccountUser, BoardRow } from "../game/backend";
 
 /* ---------- decorative corner web (pure SVG) ---------- */
 export function CornerWeb({ className = "" }: { className?: string }) {
@@ -271,7 +272,43 @@ export function Hud({ hud }: { hud: HudData }) {
             />
           </div>
         </div>
+
+        {/* health */}
+        <div className={`panel px-4 py-2.5 ${hud.hp <= 30 ? "panel-red" : ""}`}>
+          <div className="flex justify-between text-[10px] font-bold tracking-[0.25em] text-web/80">
+            <span>HEALTH</span>
+            <span className={`tabular-nums ${hud.hp <= 30 ? "text-spidey" : "text-white"}`}>{Math.round(hud.hp)}</span>
+          </div>
+          <div className="mt-1 h-2.5 bg-ink border border-web/30 overflow-hidden">
+            <div
+              className="h-full transition-[width] duration-200"
+              style={{
+                width: `${hud.hp}%`,
+                background:
+                  hud.hp > 60
+                    ? "linear-gradient(90deg,#52ffa8,#35e0ff)"
+                    : hud.hp > 30
+                      ? "linear-gradient(90deg,#ffcf3f,#ff9d2e)"
+                      : "linear-gradient(90deg,#ff2438,#b3121f)",
+              }}
+            />
+          </div>
+        </div>
+
+        {/* punch combo */}
+        {hud.punchCombo >= 2 && (
+          <div
+            key={hud.punchCombo}
+            className="anim-pop w-fit px-4 py-1 font-display text-lg tracking-widest text-outline-thin"
+            style={{ background: "rgba(255,207,63,0.14)", border: "2px solid #ffcf3f", color: "#ffcf3f", transform: "skewX(-6deg)" }}
+          >
+            PUNCH x{hud.punchCombo}
+          </div>
+        )}
       </div>
+
+      {/* damage vignette */}
+      {hud.hp < 100 && <div key={`hp-${Math.round(hud.hp / 10)}`} className="absolute inset-0 pointer-events-none damage-vignette" style={{ opacity: (100 - hud.hp) / 160 }} />}
 
       {/* contextual hint */}
       <div className="absolute bottom-5 left-1/2 -translate-x-1/2 text-center">
@@ -286,15 +323,17 @@ export function Hud({ hud }: { hud: HudData }) {
               ? "GLIDING — SOFT LANDING SAVES YOUR COMBO"
               : hud.sliding
                 ? "SPACE OUT OF THE SLIDE!"
-                : hud.speed > 2
-                  ? "LMB / Q WEB · RMB / E GLIDE"
-                  : "SHIFT RUN · CTRL SLIDE · SPACE JUMP · F DASH"}
+                : hud.punchCombo >= 2
+                  ? "KEEP THE PUNCH COMBO GOING!"
+                  : hud.speed > 2
+                    ? "LMB / Q WEB · RMB / E GLIDE · V PUNCH"
+                    : "SHIFT RUN · CTRL SLIDE · SPACE JUMP · F DASH · V PUNCH"}
         </div>
       </div>
 
       {/* mini controls */}
       <div className="absolute bottom-5 right-4 flex flex-col gap-1 text-[10px] text-web/70 font-semibold tracking-wider text-right">
-        <div><span className="text-white/80">SHIFT</span> RUN · <span className="text-white/80">CTRL/C</span> SLIDE · <span className="text-white/80">F</span> DASH</div>
+        <div><span className="text-white/80">SHIFT</span> RUN · <span className="text-white/80">CTRL/C</span> SLIDE · <span className="text-white/80">F</span> DASH · <span className="text-white/80">V</span> PUNCH</div>
         <div><span className="text-white/80">LMB/Q</span> SWING · <span className="text-white/80">RMB/E</span> GLIDE · <span className="text-white/80">R</span> RESET · <span className="text-white/80">P</span> PAUSE</div>
       </div>
     </div>
@@ -376,12 +415,45 @@ function ModeRow({
 }
 
 /* ---------- start screen ---------- */
-export function StartScreen({ best, onMode }: { best: number; onMode: (m: Mode) => void }) {
+export function StartScreen({
+  best,
+  onMode,
+  account,
+  backendOn,
+  onAccount,
+  onBoard,
+}: {
+  best: number;
+  onMode: (m: Mode) => void;
+  account: AccountUser | null;
+  backendOn: boolean;
+  onAccount: () => void;
+  onBoard: () => void;
+}) {
   return (
     <div className="absolute inset-0 overflow-hidden font-body" style={{ background: "radial-gradient(ellipse at 85% 110%, rgba(20,24,66,0.6), rgba(4,6,20,0.9) 72%)" }}>
       <CornerWeb className="absolute -top-2 -right-2 w-[560px] h-[560px] opacity-80" />
       <CornerWeb className="absolute -bottom-2 -left-2 w-[380px] h-[380px] opacity-40 rotate-180" />
       <div className="absolute inset-0 halftone opacity-[0.07]" />
+
+      {backendOn && (
+        <div className="absolute top-4 right-4 z-30 flex items-center gap-2.5">
+          {account && (
+            <div className="panel panel-red px-4 py-1.5 flex items-center gap-2">
+              <SpiderGlyph className="w-4 h-4 text-spidey" />
+              <span className="font-display text-lg leading-none text-white tracking-wider">
+                {(account.displayName ?? "SPIDER").toUpperCase()}
+              </span>
+            </div>
+          )}
+          <button onClick={onBoard} className="btn-comic px-5 py-2 text-lg bg-panel text-gold">
+            <span>LEADERBOARD</span>
+          </button>
+          <button onClick={onAccount} className="btn-comic px-5 py-2 text-lg bg-panel text-web">
+            <span>{account ? "ACCOUNT" : "SIGN IN"}</span>
+          </button>
+        </div>
+      )}
 
       <div className="relative h-full max-w-6xl mx-auto px-8 md:px-14 flex flex-col justify-center">
         {/* header */}
@@ -610,7 +682,7 @@ export function PauseScreen({ onResume, onRestart, onMenu, muted, onMute }: { on
 }
 
 /* ---------- end screens ---------- */
-export function EndScreen({ won, stats, best, isNewBest, onRetry, onMenu }: { won: boolean; stats: RunStats; best: number; isNewBest: boolean; onRetry: () => void; onMenu: () => void }) {
+export function EndScreen({ won, stats, best, isNewBest, onRetry, onMenu, onBoard }: { won: boolean; stats: RunStats; best: number; isNewBest: boolean; onRetry: () => void; onMenu: () => void; onBoard?: () => void }) {
   const Row = ({ label, value, accent }: { label: string; value: string; accent?: string }) => (
     <div className="flex items-center justify-between gap-10 py-2 border-b border-web/15">
       <span className="text-[11px] font-bold tracking-[0.28em] text-web/75">{label}</span>
@@ -621,14 +693,16 @@ export function EndScreen({ won, stats, best, isNewBest, onRetry, onMenu }: { wo
   );
   const versus = stats.mode === "versus";
   const ord = ["1ST", "2ND", "3RD", "4TH", "5TH", "6TH", "7TH", "8TH"][Math.min(stats.placement - 1, 7)] ?? `${stats.placement}TH`;
-  const title = versus ? (won ? "SKYLINE CHAMPION" : "OUTSWUNG") : won ? "PATROL COMPLETE" : "TIME'S UP";
-  const sub = versus
-    ? won
-      ? `You take the room at ${ord} place. The rooftops chant your callsign.`
-      : `You placed ${ord}. The room swings on without mercy — rematch?`
-    : won
-      ? "Every token recovered. The skyline sleeps safe tonight."
-      : `The clock beat you — ${stats.tokens} of 20 tokens recovered. The city still needs you.`;
+  const title = stats.ko ? "KNOCKED OUT" : versus ? (won ? "SKYLINE CHAMPION" : "OUTSWUNG") : won ? "PATROL COMPLETE" : "TIME'S UP";
+  const sub = stats.ko
+    ? `The thugs got you after ${stats.thugsDown} takedowns. Shake it off and swing back in.`
+    : versus
+      ? won
+        ? `You take the room at ${ord} place. The rooftops chant your callsign.`
+        : `You placed ${ord}. The room swings on without mercy — rematch?`
+      : won
+        ? "Every token recovered. The skyline sleeps safe tonight."
+        : `The clock beat you — ${stats.tokens} of 20 tokens recovered. The city still needs you.`;
   return (
     <div className="absolute inset-0 flex items-center justify-center font-body" style={{ background: "radial-gradient(ellipse at center, rgba(13,20,51,0.82), rgba(4,6,20,0.93))" }}>
       <CornerWeb className={`absolute w-[420px] h-[420px] opacity-40 ${won ? "-top-2 -right-2" : "-bottom-2 -left-2 rotate-180"}`} />
@@ -654,6 +728,7 @@ export function EndScreen({ won, stats, best, isNewBest, onRetry, onMenu }: { wo
           <Row label="TOKENS" value={`${stats.tokens}${stats.mode === "solo" ? " / 20" : ""}`} />
           <Row label="BEST COMBO" value={`x${Math.max(1, stats.maxCombo)}`} accent="#ff2438" />
           <Row label="LONGEST SWING" value={`${stats.bestSwing} m`} accent="#35e0ff" />
+          {stats.thugsDown > 0 && <Row label="THUGS DOWN" value={`${stats.thugsDown}`} accent="#52ffa8" />}
           {stats.mode === "solo" && won && <Row label="TIME TO SPARE" value={`${stats.timeLeft}s`} accent="#52ffa8" />}
           {versus && stats.standings.length > 1 && (
             <div className="pt-3">
@@ -673,9 +748,294 @@ export function EndScreen({ won, stats, best, isNewBest, onRetry, onMenu }: { wo
           <button onClick={onRetry} className="btn-comic px-12 py-3 text-2xl bg-spidey text-white text-outline-thin">
             <span>{versus ? "REMATCH" : "SWING AGAIN"}</span>
           </button>
+          {onBoard && (
+            <button onClick={onBoard} className="btn-comic px-8 py-3 text-2xl bg-panel text-gold">
+              <span>LEADERBOARD</span>
+            </button>
+          )}
           <button onClick={onMenu} className="btn-comic px-8 py-3 text-2xl bg-panel text-web">
             <span>MENU</span>
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- toast ---------- */
+export function Toast({ msg }: { msg: string }) {
+  return (
+    <div className="absolute top-6 left-1/2 -translate-x-1/2 z-50 pointer-events-none">
+      <div key={msg} className="anim-pop panel panel-red px-6 py-2">
+        <span className="font-display text-xl tracking-wider text-gold text-outline-thin">{msg}</span>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- account modal ---------- */
+export function AccountModal({
+  account,
+  backend,
+  onClose,
+  onSignedIn,
+  onSignOut,
+}: {
+  account: AccountUser | null;
+  backend: {
+    signUp: (e: string, p: string, n: string) => Promise<AccountUser>;
+    signIn: (e: string, p: string) => Promise<AccountUser>;
+    updateDisplayName: (id: string, n: string) => Promise<string>;
+  };
+  onClose: () => void;
+  onSignedIn: (u: AccountUser) => void;
+  onSignOut: () => void;
+}) {
+  const [tab, setTab] = useState<"in" | "up">("in");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setErr("");
+    setSaved(false);
+    setBusy(true);
+    try {
+      if (account) {
+        const n = await backend.updateDisplayName(account.id, name || account.displayName || "SPIDER");
+        onSignedIn({ ...account, displayName: n });
+        setSaved(true);
+      } else if (tab === "up") {
+        if (pw.length < 6) throw new Error("Password must be at least 6 characters.");
+        const u = await backend.signUp(email, pw, name || "SPIDER");
+        onSignedIn(u);
+      } else {
+        const u = await backend.signIn(email, pw);
+        onSignedIn(u);
+      }
+    } catch (ex) {
+      setErr(ex instanceof Error ? ex.message : "Something went wrong.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const tabBtn = (active: boolean) =>
+    `btn-comic px-6 py-2 text-lg ${active ? "bg-spidey text-white text-outline-thin" : "bg-panel text-web/80"}`;
+
+  return (
+    <div className="absolute inset-0 z-40 flex items-center justify-center font-body" style={{ background: "rgba(4,6,20,0.8)", backdropFilter: "blur(4px)" }} onClick={onClose}>
+      <div className="relative w-full max-w-md mx-4 anim-pop" onClick={(e) => e.stopPropagation()}>
+        <div className="panel px-8 py-6">
+          <div className="flex items-center justify-between">
+            <div className="font-display text-4xl text-spidey text-outline-thin" style={{ textShadow: "3px 3px 0 #35e0ff" }}>
+              PILOT ACCOUNT
+            </div>
+            <button onClick={onClose} className="text-web/60 hover:text-spidey font-display text-2xl leading-none transition-colors" aria-label="Close">
+              &#10005;
+            </button>
+          </div>
+
+          {account ? (
+            <form onSubmit={submit} className="mt-5 flex flex-col gap-3">
+              <div>
+                <div className="text-[10px] font-bold tracking-[0.3em] text-web/70 mb-1">SIGNED IN AS</div>
+                <div className="text-sm text-white/85 font-semibold break-all">{account.email}</div>
+              </div>
+              <div>
+                <div className="text-[10px] font-bold tracking-[0.3em] text-web/70 mb-1">CALLSIGN</div>
+                <input className="lobby-input" value={name} placeholder={account.displayName ?? "SPIDER"} maxLength={14} onChange={(e) => setName(e.target.value)} />
+              </div>
+              {err && <div className="text-spidey text-xs font-bold tracking-wide">{err}</div>}
+              {saved && <div className="text-mint text-xs font-bold tracking-wide">CALLSIGN SAVED!</div>}
+              <button type="submit" disabled={busy} className="btn-comic mt-1 px-6 py-2.5 text-xl bg-mint text-ink disabled:opacity-50">
+                <span>{busy ? "SAVING…" : "SAVE CALLSIGN"}</span>
+              </button>
+              <button type="button" onClick={onSignOut} className="btn-comic px-6 py-2 text-lg bg-panel text-spidey">
+                <span>SIGN OUT</span>
+              </button>
+            </form>
+          ) : (
+            <>
+              <div className="mt-5 flex gap-3">
+                <button onClick={() => { setTab("in"); setErr(""); }} className={tabBtn(tab === "in")}>
+                  <span>SIGN IN</span>
+                </button>
+                <button onClick={() => { setTab("up"); setErr(""); }} className={tabBtn(tab === "up")}>
+                  <span>NEW PILOT</span>
+                </button>
+              </div>
+              <form onSubmit={submit} className="mt-4 flex flex-col gap-3">
+                {tab === "up" && (
+                  <div>
+                    <div className="text-[10px] font-bold tracking-[0.3em] text-web/70 mb-1">CALLSIGN</div>
+                    <input className="lobby-input" value={name} placeholder="SPIDER" maxLength={14} onChange={(e) => setName(e.target.value)} />
+                  </div>
+                )}
+                <div>
+                  <div className="text-[10px] font-bold tracking-[0.3em] text-web/70 mb-1">EMAIL</div>
+                  <input className="lobby-input" type="email" required value={email} placeholder="you@city.net" onChange={(e) => setEmail(e.target.value)} />
+                </div>
+                <div>
+                  <div className="text-[10px] font-bold tracking-[0.3em] text-web/70 mb-1">PASSWORD</div>
+                  <input className="lobby-input" type="password" required value={pw} placeholder="••••••" onChange={(e) => setPw(e.target.value)} />
+                </div>
+                {err && <div className="text-spidey text-xs font-bold tracking-wide">{err}</div>}
+                <button type="submit" disabled={busy} className="btn-comic mt-1 px-6 py-2.5 text-xl bg-spidey text-white text-outline-thin disabled:opacity-50">
+                  <span>{busy ? "WORKING…" : tab === "up" ? "CREATE ACCOUNT" : "SIGN IN"}</span>
+                </button>
+                <div className="text-[10px] text-white/45 font-semibold tracking-wide leading-relaxed">
+                  No account? Scores stay on this device. With an account they post to the leaderboard.
+                </div>
+              </form>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- leaderboard ---------- */
+export function LeaderboardScreen({
+  mode,
+  onMode,
+  rows,
+  loading,
+  myBest,
+  account,
+  onRefresh,
+  onClose,
+}: {
+  mode: "solo" | "free" | "versus" | "all";
+  onMode: (m: "solo" | "free" | "versus" | "all") => void;
+  rows: BoardRow[];
+  loading: boolean;
+  myBest: number | null;
+  account: AccountUser | null;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  const tabs: { key: "all" | "solo" | "free" | "versus"; label: string }[] = [
+    { key: "all", label: "ALL" },
+    { key: "solo", label: "PATROL" },
+    { key: "free", label: "FREE SWING" },
+    { key: "versus", label: "VERSUS" },
+  ];
+  const modeChip = (m: string) =>
+    m === "solo" ? "#ff2438" : m === "free" ? "#52ffa8" : "#ff4fd8";
+  const rankStyle = (i: number) =>
+    i === 0 ? "#ffcf3f" : i === 1 ? "#cfd8ff" : i === 2 ? "#d9a066" : "rgba(174,243,255,0.5)";
+  return (
+    <div className="absolute inset-0 z-40 flex items-center justify-center font-body" style={{ background: "rgba(4,6,20,0.86)", backdropFilter: "blur(4px)" }}>
+      <CornerWeb className="absolute -top-2 -right-2 w-[420px] h-[420px] opacity-40" />
+      <div className="absolute inset-0 halftone opacity-[0.05]" />
+      <div className="relative w-full max-w-2xl mx-4 max-h-[88vh] flex flex-col anim-pop">
+        <div className="panel px-7 py-5 flex flex-col min-h-0 flex-1">
+          <div className="flex items-center justify-between gap-4">
+            <div className="font-display text-5xl text-gold text-outline" style={{ textShadow: "4px 4px 0 rgba(255,36,56,0.85)" }}>
+              LEADERBOARD
+            </div>
+            <div className="flex items-center gap-3">
+              <button onClick={onRefresh} className="btn-comic px-4 py-1.5 text-base bg-panel text-web" title="Refresh">
+                <span>&#8635; REFRESH</span>
+              </button>
+              <button onClick={onClose} className="text-web/60 hover:text-spidey font-display text-2xl leading-none transition-colors" aria-label="Close">
+                &#10005;
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-4 flex gap-2 flex-wrap">
+            {tabs.map((t) => (
+              <button
+                key={t.key}
+                onClick={() => onMode(t.key)}
+                className={`btn-comic px-5 py-1.5 text-base ${mode === t.key ? "bg-spidey text-white text-outline-thin" : "bg-panel text-web/80"}`}
+              >
+                <span>{t.label}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="mt-3 flex items-center justify-between gap-4">
+            {account ? (
+              <div className="text-xs font-bold tracking-widest text-white/70">
+                YOUR BEST{" "}
+                <span className="font-display text-xl tracking-normal text-gold ml-1">
+                  {myBest != null ? myBest.toLocaleString() : "—"}
+                </span>
+              </div>
+            ) : (
+              <div className="text-xs font-bold tracking-widest text-white/50">SIGN IN TO POST SCORES</div>
+            )}
+          </div>
+
+          <div className="mt-3 flex-1 min-h-0 overflow-y-auto pr-1">
+            {loading ? (
+              <div className="py-16 text-center font-display text-2xl tracking-widest text-web/60 anim-rise">
+                CONTACTING HQ…
+              </div>
+            ) : rows.length === 0 ? (
+              <div className="py-16 text-center">
+                <div className="font-display text-2xl tracking-widest text-web/50">NO RECORDS YET</div>
+                <div className="mt-2 text-xs font-semibold tracking-widest text-white/40">BE THE FIRST ON THE BOARD</div>
+              </div>
+            ) : (
+              <table className="w-full border-separate" style={{ borderSpacing: "0 4px" }}>
+                <thead>
+                  <tr className="text-[9px] font-bold tracking-[0.3em] text-web/60">
+                    <th className="text-left pl-3 pb-1 w-14">RANK</th>
+                    <th className="text-left pb-1">PILOT</th>
+                    {mode === "all" && <th className="text-left pb-1 w-24">MODE</th>}
+                    <th className="text-right pb-1 w-16">TOKENS</th>
+                    <th className="text-right pr-3 pb-1 w-28">SCORE</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r, i) => {
+                    const you = account != null && r.userId === account.id;
+                    return (
+                      <tr
+                        key={`${r.userId}-${i}`}
+                        className={`transition-colors ${you ? "bg-spidey/15" : "hover:bg-web/5"}`}
+                        style={{ boxShadow: you ? "inset 3px 0 0 #ff2438" : undefined }}
+                      >
+                        <td className="pl-3 py-1.5">
+                          <span className="font-display text-xl" style={{ color: rankStyle(i) }}>
+                            {i + 1}
+                          </span>
+                        </td>
+                        <td className="py-1.5">
+                          <span className="text-sm font-bold tracking-wide text-white/90">{r.name}</span>
+                          {you && (
+                            <span className="ml-2 font-display text-[11px] tracking-wider text-spidey">YOU</span>
+                          )}
+                        </td>
+                        {mode === "all" && (
+                          <td className="py-1.5">
+                            <span className="font-display text-[11px] tracking-wider px-1.5 py-0.5" style={{ color: modeChip(r.mode), border: `1.5px solid ${modeChip(r.mode)}` }}>
+                              {r.mode === "solo" ? "PATROL" : r.mode === "free" ? "FREE" : "VERSUS"}
+                            </span>
+                          </td>
+                        )}
+                        <td className="py-1.5 text-right text-sm font-semibold text-gold/90 tabular-nums">{r.tokens}</td>
+                        <td className="py-1.5 pr-3 text-right font-display text-xl text-white tabular-nums">{r.score.toLocaleString()}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <div className="mt-3 border-t border-web/15 pt-2 text-[9px] font-semibold tracking-[0.2em] text-white/35">
+            BEST SCORE PER PILOT · TOP 100 · STORED IN WEBSLING_SCORES
+          </div>
         </div>
       </div>
     </div>

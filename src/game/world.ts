@@ -18,6 +18,8 @@ const SPACING = 64;
 const PAD = 44; // building pad width inside a block
 export const WORLD_SPAN = ((GRID - 1) / 2) * SPACING; // 256
 export const MAX_ROOF = 66;
+export const STREET_LINES = [-224, -160, -96, -32, 32, 96, 160, 224];
+export const SIDEWALK = 8.5;
 
 function mulberry(seed: number) {
   let a = seed >>> 0;
@@ -267,7 +269,7 @@ export class City {
 
     // ---- street lamps ----
     const lamps: THREE.Vector3[] = [];
-    const streets = [-224, -160, -96, -32, 32, 96, 160, 224];
+    const streets = STREET_LINES;
     for (const sx of streets) {
       for (let z = -240; z <= 240; z += 80) {
         if (rnd() < 0.7) lamps.push(new THREE.Vector3(sx + 8.5, 0, z));

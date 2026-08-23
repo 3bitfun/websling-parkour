@@ -9,7 +9,30 @@ import {
   type Standing,
 } from "./game/engine";
 import { randomCode, type NetStatus } from "./game/net";
-import { EndScreen, Hud, LobbyScreen, PauseScreen, Popups, StartScreen } from "./components/ui";
+import {
+  BACKEND_READY,
+  fetchLeaderboard,
+  fetchMyBest,
+  getSession,
+  onAuthChange,
+  signIn,
+  signOutUser,
+  signUp,
+  updateDisplayName,
+  type AccountUser,
+  type BoardRow,
+} from "./game/backend";
+import {
+  AccountModal,
+  EndScreen,
+  Hud,
+  LeaderboardScreen,
+  LobbyScreen,
+  PauseScreen,
+  Popups,
+  StartScreen,
+  Toast,
+} from "./components/ui";
 
 const BEST_KEY = "webrunner-best-score";
 const NAME_KEY = "webrunner-name";
@@ -32,7 +55,13 @@ const initialHud: HudData = {
   sliding: false,
   gliding: false,
   dashReady: true,
+  hp: 100,
+  punchCombo: 0,
 };
+
+type BoardMode = "solo" | "free" | "versus" | "all";
+
+const backendApi = { signUp, signIn, updateDisplayName };
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -64,6 +93,17 @@ export default function App() {
   const [joined, setJoined] = useState(false);
   const [netStatus, setNetStatus] = useState<NetStatus>("off");
   const [roster, setRoster] = useState<Standing[]>([]);
+
+  // accounts / leaderboard state
+  const [account, setAccount] = useState<AccountUser | null>(null);
+  const [acctOpen, setAcctOpen] = useState(false);
+  const [boardOpen, setBoardOpen] = useState(false);
+  const [boardMode, setBoardMode] = useState<BoardMode>("all");
+  const [boardRows, setBoardRows] = useState<BoardRow[]>([]);
+  const [boardLoading, setBoardLoading] = useState(false);
+  const [myBest, setMyBest] = useState<number | null>(null);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [toast, setToast] = useState<{ id: number; msg: string } | null>(null);
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -98,10 +138,13 @@ export default function App() {
           } else {
             setIsNewBest(false);
           }
+          // a finished run may have posted a new leaderboard entry
+          if (BACKEND_READY) setRefreshTick((t) => t + 1);
         }
       },
       onRoster: setRoster,
       onNetStatus: setNetStatus,
+      onToast: (msg) => setToast({ id: Date.now(), msg }),
     });
     engineRef.current = engine;
     return () => {
@@ -110,9 +153,51 @@ export default function App() {
     };
   }, []);
 
+  // restore + track the pilot session
   useEffect(() => {
-    setMuted(hud.muted);
-  }, [hud.muted]);
+    if (!BACKEND_READY) return;
+    getSession().then(setAccount).catch(() => {});
+    const unsub = onAuthChange(setAccount);
+    return unsub;
+  }, []);
+
+  // prefill the versus callsign from the account
+  useEffect(() => {
+    if (account?.displayName && !name.trim()) setName(account.displayName);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account]);
+
+  // toast auto-dismiss
+  useEffect(() => {
+    if (!toast) return;
+    const t = window.setTimeout(() => setToast(null), 2600);
+    return () => window.clearTimeout(t);
+  }, [toast]);
+
+  // leaderboard fetch
+  useEffect(() => {
+    if (!boardOpen || !BACKEND_READY) return;
+    let live = true;
+    setBoardLoading(true);
+    (async () => {
+      try {
+        const [rows, mine] = await Promise.all([
+          fetchLeaderboard(boardMode),
+          account ? fetchMyBest(boardMode, account.id) : Promise.resolve(null),
+        ]);
+        if (!live) return;
+        setBoardRows(rows);
+        setMyBest(mine);
+      } catch {
+        if (live) setBoardRows([]);
+      } finally {
+        if (live) setBoardLoading(false);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [boardOpen, boardMode, account, refreshTick]);
 
   const blurActive = () => (document.activeElement as HTMLElement | null)?.blur?.();
 
@@ -168,6 +253,25 @@ export default function App() {
     engineRef.current?.toggleMute();
   }, []);
 
+  const openBoard = useCallback((m?: BoardMode) => {
+    blurActive();
+    if (m) setBoardMode(m);
+    setBoardOpen(true);
+  }, []);
+
+  const handleSignedIn = useCallback((u: AccountUser) => {
+    setAccount(u);
+    setAcctOpen(false);
+    setToast({ id: Date.now(), msg: `WELCOME, ${(u.displayName ?? "PILOT").toUpperCase()}` });
+  }, []);
+
+  const handleSignOut = useCallback(async () => {
+    await signOutUser();
+    setAccount(null);
+    setAcctOpen(false);
+    setToast({ id: Date.now(), msg: "SIGNED OUT" });
+  }, []);
+
   return (
     <div className="fixed inset-0 bg-ink overflow-hidden">
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
@@ -193,13 +297,54 @@ export default function App() {
           onBack={leaveLobby}
         />
       )}
-      {phase === "menu" && !lobbyOpen && <StartScreen best={best} onMode={pickMode} />}
+      {phase === "menu" && !lobbyOpen && (
+        <StartScreen
+          best={best}
+          onMode={pickMode}
+          account={account}
+          backendOn={BACKEND_READY}
+          onAccount={() => setAcctOpen(true)}
+          onBoard={() => openBoard()}
+        />
+      )}
       {phase === "paused" && (
         <PauseScreen onResume={resume} onRestart={restart} onMenu={toMenu} muted={muted} onMute={toggleMute} />
       )}
       {(phase === "won" || phase === "lost") && stats && (
-        <EndScreen won={phase === "won"} stats={stats} best={best} isNewBest={isNewBest} onRetry={restart} onMenu={toMenu} />
+        <EndScreen
+          won={phase === "won"}
+          stats={stats}
+          best={best}
+          isNewBest={isNewBest}
+          onRetry={restart}
+          onMenu={toMenu}
+          onBoard={BACKEND_READY ? () => openBoard(stats.mode === "free" ? "free" : stats.mode) : undefined}
+        />
       )}
+
+      {acctOpen && (
+        <AccountModal
+          account={account}
+          backend={backendApi}
+          onClose={() => setAcctOpen(false)}
+          onSignedIn={handleSignedIn}
+          onSignOut={handleSignOut}
+        />
+      )}
+      {boardOpen && (
+        <LeaderboardScreen
+          mode={boardMode}
+          onMode={setBoardMode}
+          rows={boardRows}
+          loading={boardLoading}
+          myBest={myBest}
+          account={account}
+          onRefresh={() => setRefreshTick((t) => t + 1)}
+          onClose={() => setBoardOpen(false)}
+        />
+      )}
+
+      {toast && <Toast key={toast.id} msg={toast.msg} />}
     </div>
   );
 }

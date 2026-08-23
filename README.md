@@ -46,11 +46,11 @@ Pushes to `main` deploy automatically through `.github/workflows/deploy-pages.ym
 
 ## Controls
 
-- **Mouse** — Look around (pointer lock)
-- **Left Click** — Shoot web / swing (hold to stay attached)
-- **Right Click** — Brake / slow down
+- **`Mouse`** — Look around (pointer lock)
+- **`Left Click` or `q`** — Shoot web / swing (hold to stay attached)
+- **`Right Click` or `e`** — Glide / slow down
 - **WASD** — Movement
-- **Space** — Shoot web (alternative)
+- **Space** — Jump
 - **Shift** — Sprint
 - **Esc** — Pause
 
