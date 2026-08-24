@@ -6,6 +6,15 @@ export interface Box {
   hx: number;
   hz: number;
   top: number;
+  /** bottom of the solid volume (skybridges float; towers start at 0) */
+  y0?: number;
+}
+
+export interface EggSpot {
+  id: string;
+  pos: THREE.Vector3;
+  r: number;
+  label: string;
 }
 
 export interface AnchorHit {
@@ -120,6 +129,10 @@ export class City {
   group = new THREE.Group();
   boxes: Box[] = [];
   tokenSpots: THREE.Vector3[] = [];
+  coinSpots: THREE.Vector3[] = [];
+  healSpots: THREE.Vector3[] = [];
+  eggs: EggSpot[] = [];
+  ufo: THREE.Group | null = null;
   spawn = new THREE.Vector3(32, 0, 14);
   beaconMat: THREE.MeshBasicMaterial;
 
@@ -164,6 +177,36 @@ export class City {
       }
     }
 
+    // ---- skybridges: connect the two tallest towers in each quadrant ----
+    const quad = (sx: number, sz: number) =>
+      this.boxes
+        .filter((b) => Math.sign(b.cx || 1) === sx && Math.sign(b.cz || 1) === sz && b.top > 30)
+        .sort((a, b) => b.top - a.top)
+        .slice(0, 2);
+    const bridgePairs: Box[][] = [quad(-1, -1), quad(-1, 1), quad(1, -1), quad(1, 1)].filter((p) => p.length === 2);
+    for (const [a, b] of bridgePairs) {
+      const hb = Math.min(a.top, b.top) - 3.5;
+      const y0 = hb - 0.7;
+      // L-shaped two-segment bridge via the corner (a.cx, b.cz)
+      const seg1: Box = {
+        cx: (a.cx + b.cx) / 2,
+        cz: a.cz,
+        hx: Math.abs(b.cx - a.cx) / 2 + 1,
+        hz: 2.6,
+        top: hb + 1.1,
+        y0,
+      };
+      const seg2: Box = {
+        cx: b.cx,
+        cz: (a.cz + b.cz) / 2,
+        hx: 2.6,
+        hz: Math.abs(b.cz - a.cz) / 2 + 1,
+        top: hb + 1.1,
+        y0,
+      };
+      this.boxes.push(seg1, seg2);
+    }
+
     // ---- instanced towers ----
     const winTex = windowTexture();
     const bGeo = new THREE.BoxGeometry(1, 1, 1);
@@ -174,11 +217,14 @@ export class City {
       emissive: new THREE.Color(0xffc873),
       emissiveIntensity: 0.75,
     });
-    const towers = new THREE.InstancedMesh(bGeo, bMat, this.boxes.length);
     const m = new THREE.Matrix4();
     const col = new THREE.Color();
     const tints = ["#2b3a6e", "#3a2f66", "#27476b", "#33315e", "#233a5e", "#3d2b55"];
-    this.boxes.forEach((b, idx) => {
+    const towerBoxes = this.boxes.filter((b) => b.y0 === undefined);
+    const bridgeBoxes = this.boxes.filter((b) => b.y0 !== undefined);
+
+    const towers = new THREE.InstancedMesh(bGeo, bMat, towerBoxes.length);
+    towerBoxes.forEach((b, idx) => {
       m.makeScale(b.hx * 2, b.top, b.hz * 2);
       m.setPosition(b.cx, 0, b.cz);
       towers.setMatrixAt(idx, m);
@@ -188,6 +234,29 @@ export class City {
     towers.instanceMatrix.needsUpdate = true;
     if (towers.instanceColor) towers.instanceColor.needsUpdate = true;
     this.group.add(towers);
+
+    // skybridges: plain dark hull with a neon underslung strip
+    if (bridgeBoxes.length > 0) {
+      const brMat = new THREE.MeshLambertMaterial({ color: 0x1b2242 });
+      const bridges = new THREE.InstancedMesh(bGeo, brMat, bridgeBoxes.length);
+      bridgeBoxes.forEach((b, idx) => {
+        const h = b.top - (b.y0 ?? 0);
+        m.makeScale(b.hx * 2, h, b.hz * 2);
+        m.setPosition(b.cx, b.y0 ?? 0, b.cz);
+        bridges.setMatrixAt(idx, m);
+      });
+      bridges.instanceMatrix.needsUpdate = true;
+      this.group.add(bridges);
+      const stripMat = new THREE.MeshBasicMaterial({ color: 0x35e0ff, transparent: true, opacity: 0.85 });
+      const strips = new THREE.InstancedMesh(bGeo, stripMat, bridgeBoxes.length);
+      bridgeBoxes.forEach((b, idx) => {
+        m.makeScale(b.hx * 2 + 0.3, 0.35, b.hz * 2 + 0.3);
+        m.setPosition(b.cx, (b.y0 ?? 0) - 0.4, b.cz);
+        strips.setMatrixAt(idx, m);
+      });
+      strips.instanceMatrix.needsUpdate = true;
+      this.group.add(strips);
+    }
 
     // ---- neon billboards ----
     const tallBoxes = this.boxes.filter((b) => b.top > 30);
@@ -373,6 +442,160 @@ export class City {
         vertical ? new THREE.Vector3(street + jitter, y, along) : new THREE.Vector3(along, y, street + jitter)
       );
     }
+
+    // ---- coin spots: street-level trails + rooftop stashes ----
+    const crnd = mulberry(9001);
+    for (let i = 0; i < 50; i++) {
+      const street = STREET_LINES[Math.floor(crnd() * STREET_LINES.length)];
+      const along = (crnd() * 2 - 1) * 240;
+      const j = (crnd() - 0.5) * 7;
+      this.coinSpots.push(
+        crnd() < 0.5 ? new THREE.Vector3(street + j, 1.6, along) : new THREE.Vector3(along, 1.6, street + j)
+      );
+    }
+    const roofBoxes = this.boxes.filter((b) => b.y0 === undefined && b.top > 16);
+    for (let i = 0; i < 30; i++) {
+      const b = roofBoxes[Math.floor(crnd() * roofBoxes.length)];
+      this.coinSpots.push(new THREE.Vector3(b.cx + (crnd() - 0.5) * b.hx, b.top + 2, b.cz + (crnd() - 0.5) * b.hz));
+      if (i < 12) {
+        this.healSpots.push(new THREE.Vector3(b.cx - (crnd() - 0.5) * b.hx, b.top + 1.4, b.cz - (crnd() - 0.5) * b.hz));
+      }
+    }
+
+    // ---- landmark: the BIG SPIDER on the tallest tower ----
+    const tallest = [...towerBoxes].sort((a, b) => b.top - a.top)[0];
+    if (tallest) {
+      const sp = new THREE.Group();
+      const redM = new THREE.MeshLambertMaterial({ color: 0xe6273a, emissive: 0x40101a });
+      const darkM = new THREE.MeshLambertMaterial({ color: 0x141833 });
+      const body = new THREE.Mesh(new THREE.SphereGeometry(4.2, 16, 14), redM);
+      body.scale.set(1, 0.82, 1.25);
+      body.position.y = 5.5;
+      const headM = new THREE.Mesh(new THREE.SphereGeometry(2.6, 16, 14), redM);
+      headM.position.set(0, 8.6, 4.4);
+      const eyeM = new THREE.MeshBasicMaterial({ color: 0xf4fbff });
+      const e1 = new THREE.Mesh(new THREE.SphereGeometry(0.85, 10, 8), eyeM);
+      e1.scale.set(0.7, 1.2, 0.5);
+      e1.position.set(-1, 9, 6.6);
+      const e2 = e1.clone();
+      e2.position.x = 1;
+      sp.add(body, headM, e1, e2);
+      for (let k = 0; k < 8; k++) {
+        const a = (k / 8) * Math.PI * 2;
+        const leg = new THREE.Mesh(new THREE.BoxGeometry(0.7, 7, 0.7), darkM);
+        leg.position.set(Math.cos(a) * 5.5, 3.2, Math.sin(a) * 5.5);
+        leg.rotation.z = Math.cos(a) * 0.55;
+        leg.rotation.x = -Math.sin(a) * 0.55;
+        sp.add(leg);
+      }
+      sp.position.set(tallest.cx, tallest.top, tallest.cz);
+      sp.rotation.y = 0.6;
+      this.group.add(sp);
+      this.eggs.push({ id: "spider", pos: new THREE.Vector3(tallest.cx, tallest.top + 13, tallest.cz), r: 14, label: "THE BIG SPIDER" });
+    }
+
+    // ---- landmark: UFO hovering in the northwest sky ----
+    {
+      const ufo = new THREE.Group();
+      const hull = new THREE.Mesh(
+        new THREE.CylinderGeometry(7, 13, 3.4, 24),
+        new THREE.MeshLambertMaterial({ color: 0x8d93a8, emissive: 0x11141f })
+      );
+      const dome = new THREE.Mesh(
+        new THREE.SphereGeometry(5, 20, 14, 0, Math.PI * 2, 0, Math.PI / 2),
+        new THREE.MeshBasicMaterial({ color: 0x7ef0ff, transparent: true, opacity: 0.6 })
+      );
+      dome.position.y = 1.6;
+      const beam = new THREE.Mesh(
+        new THREE.CylinderGeometry(3, 9, 26, 20, 1, true),
+        new THREE.MeshBasicMaterial({ color: 0x52ffa8, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false })
+      );
+      beam.position.y = -14.6;
+      const ringMat = new THREE.MeshBasicMaterial({ color: 0xffcf3f });
+      for (let k = 0; k < 10; k++) {
+        const a = (k / 10) * Math.PI * 2;
+        const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.55, 8, 8), k % 2 ? ringMat : new THREE.MeshBasicMaterial({ color: 0xff2438 }));
+        bulb.position.set(Math.cos(a) * 11, -0.6, Math.sin(a) * 11);
+        ufo.add(bulb);
+      }
+      ufo.add(hull, dome, beam);
+      ufo.position.set(-236, 118, -236);
+      this.ufo = ufo;
+      this.group.add(ufo);
+      this.eggs.push({ id: "ufo", pos: new THREE.Vector3(-236, 116, -236), r: 24, label: "UNIDENTIFIED SWINGING OBJECT" });
+    }
+
+    // ---- landmark: giant rubber duck on an eastern roof ----
+    const duckRoof = roofBoxes.find((b) => b.cx > 60 && b.cz > -40 && b.cz < 80 && b.top > 20 && b.top < 46) ?? roofBoxes[3];
+    if (duckRoof) {
+      const duck = new THREE.Group();
+      const yM = new THREE.MeshLambertMaterial({ color: 0xffcf3f, emissive: 0x2a2005 });
+      const oM = new THREE.MeshLambertMaterial({ color: 0xff9d2e });
+      const bodyD = new THREE.Mesh(new THREE.SphereGeometry(5, 16, 14), yM);
+      bodyD.scale.set(1, 0.8, 1.3);
+      bodyD.position.y = 3.6;
+      const headD = new THREE.Mesh(new THREE.SphereGeometry(3, 16, 14), yM);
+      headD.position.set(0, 9, 3.4);
+      const beak = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1, 2.6), oM);
+      beak.position.set(0, 8.6, 6.4);
+      const eyeDM = new THREE.MeshBasicMaterial({ color: 0x0d1024 });
+      const de1 = new THREE.Mesh(new THREE.SphereGeometry(0.5, 8, 8), eyeDM);
+      de1.position.set(-1.5, 10.2, 5.4);
+      const de2 = de1.clone();
+      de2.position.x = 1.5;
+      duck.add(bodyD, headD, beak, de1, de2);
+      duck.position.set(duckRoof.cx, duckRoof.top, duckRoof.cz);
+      duck.rotation.y = -0.8;
+      this.group.add(duck);
+      this.eggs.push({ id: "duck", pos: new THREE.Vector3(duckRoof.cx, duckRoof.top + 12, duckRoof.cz), r: 12, label: "RUBBER DUCKIE SUPREMACY" });
+    }
+
+    // ---- landmark: TUNG TUNG TUNG SAHUR, guardian of the far corner ----
+    {
+      const tung = new THREE.Group();
+      const wood = new THREE.MeshLambertMaterial({ color: 0x9c6b3f, emissive: 0x1c0f06 });
+      const woodDark = new THREE.MeshLambertMaterial({ color: 0x6e4a2b });
+      const pedestal = new THREE.Mesh(new THREE.BoxGeometry(12, 1.6, 12), new THREE.MeshLambertMaterial({ color: 0x1b2242, emissive: 0x35e0ff, emissiveIntensity: 0.25 }));
+      pedestal.position.y = 0.8;
+      const torsoT = new THREE.Mesh(new THREE.BoxGeometry(3.4, 10, 2.4), wood);
+      torsoT.position.y = 6.8;
+      const headT = new THREE.Mesh(new THREE.SphereGeometry(2.4, 14, 12), wood);
+      headT.scale.set(1, 1.15, 1);
+      headT.position.y = 13.6;
+      const eyeT = new THREE.MeshBasicMaterial({ color: 0xffffff });
+      const pupilT = new THREE.MeshBasicMaterial({ color: 0x0d1024 });
+      const tw1 = new THREE.Mesh(new THREE.SphereGeometry(0.75, 10, 8), eyeT);
+      tw1.position.set(-0.9, 14.2, 1.9);
+      const tw2 = tw1.clone();
+      tw2.position.x = 0.9;
+      const tp1 = new THREE.Mesh(new THREE.SphereGeometry(0.3, 8, 8), pupilT);
+      tp1.position.set(-0.9, 14.2, 2.5);
+      const tp2 = tp1.clone();
+      tp2.position.x = 0.9;
+      const mouth = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.5, 0.4), pupilT);
+      mouth.position.set(0, 12.6, 2.2);
+      const armL = new THREE.Mesh(new THREE.BoxGeometry(1, 6, 1), woodDark);
+      armL.position.set(-2.6, 8.4, 0.6);
+      armL.rotation.z = 0.5;
+      const armR = new THREE.Mesh(new THREE.BoxGeometry(1, 6, 1), woodDark);
+      armR.position.set(2.8, 9.6, 1.2);
+      armR.rotation.z = -1.1;
+      const bat = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.5, 7, 10), woodDark);
+      bat.position.set(4.6, 12, 1.6);
+      bat.rotation.z = -0.5;
+      const legL = new THREE.Mesh(new THREE.BoxGeometry(1.2, 3.4, 1.2), woodDark);
+      legL.position.set(-1, 1.9, 0);
+      const legR = legL.clone();
+      legR.position.x = 1;
+      tung.add(pedestal, torsoT, headT, tw1, tw2, tp1, tp2, mouth, armL, armR, bat, legL, legR);
+      tung.position.set(246, 0, 246);
+      tung.rotation.y = -2.3;
+      this.group.add(tung);
+      const label = makeTextSprite("TUNG TUNG TUNG SAHUR");
+      label.position.set(246, 21, 246);
+      this.group.add(label);
+      this.eggs.push({ id: "tung", pos: new THREE.Vector3(246, 8, 246), r: 18, label: "TUNG TUNG TUNG SAHUR" });
+    }
   }
 
   /** Best web anchor: closest rooftop point to a desired point ahead+above, else sky anchor. */
@@ -411,3 +634,22 @@ export class City {
 }
 
 const _v1 = new THREE.Vector3();
+
+function makeTextSprite(text: string): THREE.Sprite {
+  const cv = document.createElement("canvas");
+  cv.width = 1024;
+  cv.height = 160;
+  const c = cv.getContext("2d")!;
+  c.font = "900 88px 'Bangers', 'Impact', sans-serif";
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  c.lineWidth = 18;
+  c.strokeStyle = "#04071c";
+  c.strokeText(text, 512, 84);
+  c.fillStyle = "#ffcf3f";
+  c.fillText(text, 512, 84);
+  const tex = new THREE.CanvasTexture(cv);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, fog: false, depthWrite: false }));
+  sprite.scale.set(46, 7.2, 1);
+  return sprite;
+}

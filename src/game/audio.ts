@@ -144,6 +144,35 @@ export class Sfx {
     this.tone(930, 0.14, "sine", 0.16, undefined, 0.07);
   }
 
+  /* ---------- pickups / style ---------- */
+  coin() {
+    this.tone(1320, 0.07, "square", 0.16);
+    this.tone(1980, 0.12, "square", 0.14, undefined, 0.055);
+  }
+  sparkle() {
+    [880, 1174, 1568, 2093].forEach((f, i) => this.tone(f, 0.14, "sine", 0.15, undefined, i * 0.06));
+  }
+  flip() {
+    this.noise(0.18, 1400, 0.2, 2, 3400);
+    this.tone(340, 0.16, "sine", 0.14, 900);
+  }
+  slowmo() {
+    this.tone(900, 0.7, "sine", 0.2, 110);
+    this.tone(1400, 0.5, "triangle", 0.1, 220, 0.05);
+  }
+  swingHit() {
+    this.tone(150, 0.2, "sine", 0.5, 50);
+    this.noise(0.16, 1300, 0.4, 1, 2600);
+    this.tone(2200, 0.06, "square", 0.12, undefined, 0.02);
+  }
+  tung() {
+    // tung tung tung... sahur!
+    [0, 0.24, 0.48, 0.86].forEach((t, i) => {
+      this.tone(i === 3 ? 196 : 147, 0.2, "sine", 0.5, 55, t);
+      this.noise(0.1, 420, 0.3, 0.5, undefined, t);
+    });
+  }
+
   /* ---------- web throw + wall climb ---------- */
   webShot() {
     this.noise(0.1, 2400, 0.2, 2, 4200);

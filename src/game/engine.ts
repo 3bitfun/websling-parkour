@@ -260,6 +260,43 @@ export class Engine {
   private braking = false;
   private locked = false;
 
+  // touch input (mobile) — held states + joystick; edge actions come through methods
+  touch = { joyX: 0, joyY: 0, web: false, glide: false, slide: false };
+  private coarse =
+    typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
+
+  touchJump() {
+    if (this.phase !== "playing" || this.countdown > 0) return;
+    this.jumpBufT = 0.14;
+  }
+  touchPunch() {
+    this.tryPunch();
+  }
+  touchDash() {
+    this.tryDash();
+  }
+  touchWebShot() {
+    this.tryWebShot();
+  }
+  touchWebRelease() {
+    if (this.attached) this.detach(true);
+  }
+  /** Drag-to-look for touch devices (bypasses pointer lock). */
+  lookDelta(dx: number, dy: number) {
+    if (this.phase !== "playing") return;
+    this.yaw -= dx * 0.0042;
+    this.pitch = THREE.MathUtils.clamp(this.pitch - dy * 0.0038, -1.05, 0.6);
+  }
+  private lockPointer() {
+    // pointer lock is desktop-only; touch devices drive the camera via lookDelta
+    if (!window.matchMedia("(pointer: fine)").matches) return;
+    try {
+      this.canvas.requestPointerLock();
+    } catch {
+      /* unsupported */
+    }
+  }
+
   // parkour movement
   private jumpBufT = 0;
   private jumpCut = false;
@@ -277,6 +314,22 @@ export class Engine {
   private camGlide = 0;
   private glider!: THREE.Group;
   private gliderS = 0;
+
+  // tricks + slow-mo
+  private timeScale = 1;
+  private slowmoT = 0;
+  private trickCount = 0;
+  private trickAnimT = 0;
+  private trickAnimType: "flip" | "spin" = "flip";
+  private trickAirTime = 0;
+
+  // coins / heals / eggs
+  private coins = 0;
+  private eggsFound = new Set<string>();
+  private eggScanT = 0;
+
+  // swing damage into crowds
+  private swingHitCd = 0;
 
   // wall climbing
   private climbing = false;
@@ -378,7 +431,7 @@ export class Engine {
       this.pitch = THREE.MathUtils.clamp(this.pitch - e.movementY * 0.0021, -1.05, 0.6);
     };
     this.onMouseDown = (e) => {
-      if (this.phase !== "playing") return;
+      if (this.phase !== "playing" || this.coarse) return;
       if (e.button === 0) {
         this.mouseWeb = true;
         this.refireT = 0;
@@ -389,6 +442,7 @@ export class Engine {
       } else if (e.button === 2) this.glideHeld = true;
     };
     this.onMouseUp = (e) => {
+      if (this.coarse) return;
       if (e.button === 0) {
         this.mouseWeb = false;
         if (this.attached) this.detach(true);
@@ -403,7 +457,7 @@ export class Engine {
       if (document.hidden && this.phase === "playing") this.pause();
     };
     this.onCanvasClick = () => {
-      if (this.phase === "playing" && !this.locked) this.canvas.requestPointerLock();
+      if (this.phase === "playing" && !this.locked) this.lockPointer();
     };
 
     window.addEventListener("resize", this.onResize);
@@ -607,7 +661,7 @@ export class Engine {
     this.sfx.startWind();
     this.resetRun();
     this.setPhase("playing");
-    this.canvas.requestPointerLock();
+    this.lockPointer();
     this.sfx.ui();
   }
 
@@ -629,6 +683,11 @@ export class Engine {
     this.mouseWeb = false;
     this.glideHeld = false;
     this.slideHeld = false;
+    this.touch.joyX = 0;
+    this.touch.joyY = 0;
+    this.touch.web = false;
+    this.touch.glide = false;
+    this.touch.slide = false;
     this.setPhase("paused");
     if (document.pointerLockElement === this.canvas) document.exitPointerLock();
   }
@@ -797,7 +856,13 @@ export class Engine {
     if (e.ctrlKey && (e.code === "KeyC" || e.code === "KeyW" || e.code === "KeyR") && this.phase === "playing") e.preventDefault();
     this.keys.add(e.code);
     if (this.phase === "playing") {
-      if (e.code === "Space" && !e.repeat) this.jumpBufT = 0.14;
+      if (e.code === "Space" && !e.repeat) {
+        this.jumpBufT = 0.14;
+        if (!this.grounded && this.coyoteT <= 0 && !this.attached && !this.gliding && !this.climbing) this.tryTrick("flip");
+      }
+      if ((e.code === "ShiftLeft" || e.code === "ShiftRight") && !e.repeat) {
+        if (!this.grounded && !this.attached && !this.gliding && !this.climbing) this.tryTrick("spin");
+      }
       if ((e.code === "KeyQ") && !e.repeat) {
         if (this.attached) this.detach(true);
         else this.tryWeb();
@@ -971,6 +1036,38 @@ export class Engine {
     if (this.comboCount === 3) this.popupAt(_v.set(at.x, at.y + 1.2, at.z), "COMBO!", "gold");
   }
 
+  private tryTrick(type: "flip" | "spin") {
+    if (this.trickAnimT > 0 || this.countdown > 0) return;
+    this.trickAnimType = type;
+    this.trickAnimT = 0.5;
+    this.trickCount++;
+    const pts = 120 * this.trickCount;
+    this.score += pts;
+    this.sfx.flip();
+    this.particles.burst(this.pos, 10, type === "flip" ? ["#aef3ff", "#ffffff"] : ["#ff4fd8", "#ffffff"], 6, 0.45, 2);
+    this.popupAt(_v.set(this.pos.x, this.pos.y + 1.6, this.pos.z), `${type === "flip" ? "FLIP" : "SPIN"} +${pts}`, "cyan");
+    // chaining 3+ tricks in one airtime triggers slow-mo so you can admire it
+    if (this.trickCount === 3 && this.slowmoT <= 0) {
+      this.slowmoT = 1.25;
+      this.sfx.slowmo();
+      this.popupAt(_v.set(this.pos.x, this.pos.y + 2.6, this.pos.z), "SLOW-MO STYLE!", "gold");
+    }
+  }
+
+  private landTricks() {
+    if (this.trickCount > 0) {
+      if (this.trickCount >= 2) {
+        const bank = 200 * this.trickCount;
+        this.score += bank;
+        this.popupAt(_v.set(this.pos.x, this.pos.y + 1.8, this.pos.z), `TRICK COMBO x${this.trickCount} +${bank}`, "gold");
+      }
+      this.trickCount = 0;
+    }
+    this.trickAnimT = 0;
+    this.rig.group.rotation.set(0, 0, 0);
+    this.trickAirTime = 0;
+  }
+
   private onThugKilled(at: THREE.Vector3) {
     const bounty = 250 * Math.max(1, this.combo);
     this.score += bounty;
@@ -1032,6 +1129,11 @@ export class Engine {
     let st = 0;
     if (this.keys.has("KeyD")) st += 1;
     if (this.keys.has("KeyA")) st -= 1;
+    // touch: joystick up climbs / down descends, sideways shimmies along the face
+    vy += -this.touch.joyY * 7.2;
+    const jwx = Math.sin(this.yaw) * this.touch.joyY + Math.cos(this.yaw) * this.touch.joyX;
+    const jwz = Math.cos(this.yaw) * this.touch.joyY - Math.sin(this.yaw) * this.touch.joyX;
+    st += jwx * tang.x + jwz * tang.z;
     const vt = st * 5.2;
 
     this.pos.addScaledVector(tang, vt * h);
@@ -1166,7 +1268,11 @@ export class Engine {
     if (this.keys.has("KeyS")) wish.sub(fwdH);
     if (this.keys.has("KeyD")) wish.add(rightH);
     if (this.keys.has("KeyA")) wish.sub(rightH);
+    // virtual joystick (touch): up = forward
+    wish.addScaledVector(fwdH, -this.touch.joyY);
+    wish.addScaledVector(rightH, this.touch.joyX);
     if (wish.lengthSq() > 0) wish.normalize();
+    const joyMag = Math.hypot(this.touch.joyX, this.touch.joyY);
 
     const hs0 = Math.hypot(this.vel.x, this.vel.z);
 
@@ -1191,11 +1297,12 @@ export class Engine {
     // ---- slide state machine ----
     if (this.sliding) {
       this.slideT += h;
-      if (!this.grounded || this.slideT > 1.15 || (!this.slideHeld && this.slideT > 0.3) || hs0 < 4.5) {
+      const slideHeld = this.slideHeld || this.touch.slide;
+      if (!this.grounded || this.slideT > 1.15 || (!slideHeld && this.slideT > 0.3) || hs0 < 4.5) {
         this.sliding = false;
         this.slideCool = 0.45;
       }
-    } else if (this.slideHeld && this.grounded && this.slideCool <= 0 && hs0 > 8) {
+    } else if ((this.slideHeld || this.touch.slide) && this.grounded && this.slideCool <= 0 && hs0 > 8) {
       this.sliding = true;
       this.slideT = 0;
       const boost = 1 + Math.min(0.35, 4 / Math.max(hs0, 1));
@@ -1236,14 +1343,15 @@ export class Engine {
 
     // ---- glide / parachute (air) & brake (ground) ----
     this.gliding = false;
-    if (this.glideHeld && !this.grounded) {
+    const glideHeld = this.glideHeld || this.touch.glide;
+    if (glideHeld && !this.grounded) {
       if (this.attached) this.detach(false);
       this.gliding = true;
       this.sliding = false;
     }
 
     if (this.grounded) {
-      if (this.glideHeld) {
+      if (glideHeld) {
         // hard brake
         const f = Math.exp(-3.4 * h);
         this.vel.x *= f;
@@ -1259,7 +1367,8 @@ export class Engine {
         const damp = wish.lengthSq() > 0 ? 2.2 : 9;
         this.vel.x *= Math.exp(-damp * h);
         this.vel.z *= Math.exp(-damp * h);
-        const cap = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight") ? 26 : 15;
+        const cap =
+          this.keys.has("ShiftLeft") || this.keys.has("ShiftRight") || joyMag > 0.85 ? 26 : 15;
         const hs = Math.hypot(this.vel.x, this.vel.z);
         if (hs > cap) {
           this.vel.x *= cap / hs;
@@ -1316,9 +1425,10 @@ export class Engine {
       const ez = b.hz + R;
       const ox = this.pos.x - b.cx;
       const oz = this.pos.z - b.cz;
-      if (ox < -ex || ox > ex || oz < -ez || oz > ez || this.pos.y > b.top + R || this.pos.y < -1) continue;
+      const by0 = b.y0 ?? 0;
+      if (ox < -ex || ox > ex || oz < -ez || oz > ez || this.pos.y > b.top + R || this.pos.y < by0 - 1) continue;
       const cx = THREE.MathUtils.clamp(this.pos.x, b.cx - b.hx, b.cx + b.hx);
-      const cy = THREE.MathUtils.clamp(this.pos.y, 0, b.top);
+      const cy = THREE.MathUtils.clamp(this.pos.y, by0, b.top);
       const cz = THREE.MathUtils.clamp(this.pos.z, b.cz - b.hz, b.cz + b.hz);
       let nx = this.pos.x - cx;
       let ny = this.pos.y - cy;
@@ -1382,6 +1492,7 @@ export class Engine {
 
   private land(fallV: number) {
     if (this.attached && this.attachT > 0.2) this.detach(false);
+    this.landTricks();
     const soft = this.gliding;
     if (soft) {
       // parachute touchdown — gentle, and it protects the combo
@@ -1406,6 +1517,12 @@ export class Engine {
   private frame(dt: number) {
     this.elapsed += dt;
 
+    // slow-mo eases in and out; physics & cooldowns run on scaled time, the run clock stays fair
+    const tsTarget = this.slowmoT > 0 ? 0.3 : 1;
+    this.timeScale += (tsTarget - this.timeScale) * (1 - Math.exp(-14 * dt));
+    if (this.slowmoT > 0) this.slowmoT -= dt;
+    const gdt = dt * this.timeScale;
+
     if (this.phase === "playing") {
       if (this.countdown > 0) {
         this.countdown -= dt;
@@ -1415,14 +1532,14 @@ export class Engine {
           this.sfx.thwip();
         }
       } else {
-        this.acc += dt;
+        this.acc += gdt;
         while (this.acc >= STEP) {
           this.step(STEP);
           this.acc -= STEP;
         }
-        this.cooldown = Math.max(0, this.cooldown - dt);
-        this.refireT = Math.max(0, this.refireT - dt);
-        if (this.mouseWeb && !this.attached && this.cooldown <= 0 && this.refireT <= 0) {
+        this.cooldown = Math.max(0, this.cooldown - gdt);
+        this.refireT = Math.max(0, this.refireT - gdt);
+        if ((this.mouseWeb || this.touch.web) && !this.attached && this.cooldown <= 0 && this.refireT <= 0) {
           this.tryWeb();
           this.refireT = 0.3;
         }
@@ -1513,18 +1630,65 @@ export class Engine {
         if (this.comboT <= 0) this.comboCount = 0;
       }
     }
+    this.swingHitCd = Math.max(0, this.swingHitCd - dt);
     this.crowd.update(dt, {
       active: this.phase === "playing" && this.countdown <= 0,
       playerPos: this.pos,
+      playerVel: this.vel,
+      swingHitCd: this.swingHitCd,
       invuln: this.invulnT > 0,
       elapsed: this.elapsed,
       punches: this.punches,
       damagePlayer: (n, from) => this.damagePlayer(n, from),
       onPunchHit: (heavy, at) => this.onPunchHit(heavy, at),
       onThugKilled: (at) => this.onThugKilled(at),
+      onSwingHit: (pts, at) => {
+        this.score += pts;
+        this.swingHitCd = 0.45;
+        this.shake = Math.min(1.3, this.shake + 0.3);
+        this.sfx.swingHit();
+        this.particles.burst(at, 16, ["#ffffff", "#35e0ff", "#ffcf3f"], 9, 0.5, 2.6);
+        this.popupAt(at, `SWING HIT +${pts}`, "gold");
+      },
+      onCoin: () => {
+        this.coins++;
+        this.score += 25;
+        this.sfx.coin();
+      },
+      onHeal: (at) => {
+        this.hp = Math.min(100, this.hp + 25);
+        this.sfx.heal();
+        this.popupAt(at, "+25 HP", "cyan");
+        this.particles.burst(at, 14, ["#52ffa8", "#ffffff"], 5, 0.5, 2.2);
+      },
       particles: this.particles,
       sfx: this.sfx,
     });
+
+    // easter egg proximity scan
+    if (this.phase === "playing") {
+      this.eggScanT -= dt;
+      if (this.eggScanT <= 0) {
+        this.eggScanT = 0.25;
+        for (const egg of this.city.eggs) {
+          if (this.eggsFound.has(egg.id)) continue;
+          if (this.pos.distanceToSquared(egg.pos) < egg.r * egg.r) {
+            this.eggsFound.add(egg.id);
+            this.score += 500;
+            this.sfx.sparkle();
+            if (egg.id === "tung") this.sfx.tung();
+            this.popupAt(_v.set(this.pos.x, this.pos.y + 2.2, this.pos.z), `EASTER EGG — ${egg.label} +500`, "gold");
+            this.particles.burst(this.pos, 30, ["#ffcf3f", "#ff4fd8", "#35e0ff", "#ffffff"], 10, 1, 3);
+          }
+        }
+      }
+    }
+
+    // UFO drift + spin
+    if (this.city.ufo) {
+      this.city.ufo.rotation.y += dt * 0.5;
+      this.city.ufo.position.y = 118 + Math.sin(this.elapsed * 0.6) * 6;
+    }
     this.updateWebShots(dt);
 
     this.particles.update(dt);
@@ -2114,10 +2278,11 @@ function rayBoxT(o: THREE.Vector3, d: THREE.Vector3, b: Box): number {
     if (t2 < tmax) tmax = t2;
     if (tmin > tmax) return -1;
   }
+  const by0 = b.y0 ?? 0;
   if (Math.abs(d.y) < 1e-9) {
-    if (o.y < 0 || o.y > b.top) return -1;
+    if (o.y < by0 || o.y > b.top) return -1;
   } else {
-    let t1 = (0 - o.y) / d.y;
+    let t1 = (by0 - o.y) / d.y;
     let t2 = (b.top - o.y) / d.y;
     if (t1 > t2) {
       const s = t1;

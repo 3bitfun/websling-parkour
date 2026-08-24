@@ -19,12 +19,17 @@ export interface PunchEvent {
 export interface CrowdApi {
   active: boolean;
   playerPos: THREE.Vector3;
+  playerVel: THREE.Vector3;
+  swingHitCd: number;
   invuln: boolean;
   elapsed: number;
   punches: PunchEvent[];
   damagePlayer(n: number, from: THREE.Vector3): void;
   onPunchHit(heavy: boolean, pos: THREE.Vector3): void;
   onThugKilled(pos: THREE.Vector3): void;
+  onSwingHit(points: number, pos: THREE.Vector3): void;
+  onCoin(pos: THREE.Vector3): void;
+  onHeal(pos: THREE.Vector3): void;
   particles: { burst(p: THREE.Vector3, n: number, colors: string[], speed?: number, life?: number, size?: number): void };
   sfx: Sfx;
 }
@@ -56,6 +61,8 @@ interface Thug {
   rig: Rig;
   spawn: THREE.Vector3;
   hp: number;
+  maxHp: number;
+  gang: GangDef;
   dead: boolean;
   respawnT: number;
   flash: number;
@@ -70,6 +77,8 @@ interface Thug {
   phase: number;
   webT: number;
   cocoon: THREE.Mesh;
+  hpBar: THREE.Mesh;
+  swingCd: number;
 }
 
 interface Rock {
@@ -79,8 +88,42 @@ interface Rock {
   life: number;
 }
 
+interface Coin {
+  mesh: THREE.Group;
+  baseY: number;
+  phase: number;
+  taken: boolean;
+}
+
+interface Heal {
+  mesh: THREE.Group;
+  baseY: number;
+  phase: number;
+  taken: boolean;
+  respawn: number;
+}
+
+interface GangDef {
+  name: string;
+  color: string;
+  torso: number;
+  arms: number;
+  legs: number;
+  hpMul: number;
+  speed: number;
+  dmg: number;
+  aggro: number; // awareness radius
+  bounty: number;
+}
+
+const GANGS: GangDef[] = [
+  { name: "SKULLS", color: "#e8e6df", torso: 0x33374a, arms: 0x3c4157, legs: 0x24283a, hpMul: 1, speed: 2.1, dmg: 12, aggro: 40, bounty: 250 },
+  { name: "VIPERS", color: "#52ffa8", torso: 0x1d4034, arms: 0x245743, legs: 0x153026, hpMul: 0.8, speed: 3.1, dmg: 9, aggro: 46, bounty: 300 },
+  { name: "EMBER", color: "#ff9d2e", torso: 0x4a2a17, arms: 0x5e3a1e, legs: 0x351d0e, hpMul: 1.35, speed: 1.7, dmg: 16, aggro: 34, bounty: 400 },
+];
+
 const CIV_COUNT = 46;
-const THUG_COUNT = 18;
+const THUG_COUNT = 21;
 const THUG_HP = 100;
 
 export class Crowd {
@@ -89,6 +132,8 @@ export class Crowd {
   private civs: Civ[] = [];
   private thugs: Thug[] = [];
   private rocks: Rock[] = [];
+  private coins: Coin[] = [];
+  private heals: Heal[] = [];
   private thugSpawns: THREE.Vector3[] = [];
   private geoRock = new THREE.SphereGeometry(0.34, 8, 8);
   private matRock = new THREE.MeshToonMaterial({ color: 0x8d93a8 });
@@ -147,17 +192,33 @@ export class Crowd {
       this.thugSpawns.push(pool[Math.floor(rnd() * pool.length)].clone());
     }
 
+    const geoBand = new THREE.BoxGeometry(1.24 * 0.42, 0.14, 1.24 * 0.42);
+    const geoHp = new THREE.PlaneGeometry(1.1, 0.12);
     for (let i = 0; i < THUG_COUNT; i++) {
-      const rig = buildR6Rig(thugStyle());
+      const sp = this.thugSpawns[i];
+      // territory: gang picked from which region of the city the spawn sits in
+      const region = (sp.x >= 0 ? 1 : 0) + (sp.z >= 0 ? 2 : 0);
+      const gang = GANGS[region % GANGS.length];
+      const rig = buildR6Rig(thugStyle(gang));
       rig.group.scale.setScalar(1.06);
+      const band = new THREE.Mesh(geoBand, new THREE.MeshBasicMaterial({ color: gang.torso === 0x33374a ? 0xe8e6df : new THREE.Color(gang.color).getHex() }));
+      band.position.y = 4.6 * 0.42 + 0.16;
+      rig.group.add(band);
       const cocoon = new THREE.Mesh(this.geoCocoon, this.matCocoon);
       cocoon.position.y = 1.1;
       cocoon.visible = false;
       rig.group.add(cocoon);
+      const hpBar = new THREE.Mesh(geoHp, new THREE.MeshBasicMaterial({ color: new THREE.Color(gang.color), transparent: true, opacity: 0.9, depthWrite: false }));
+      hpBar.position.y = 5.6 * 0.42;
+      hpBar.renderOrder = 20;
+      rig.group.add(hpBar);
+      const maxHp = Math.round(THUG_HP * gang.hpMul);
       const t: Thug = {
         rig,
-        spawn: this.thugSpawns[i],
-        hp: THUG_HP,
+        spawn: sp.clone(),
+        hp: maxHp,
+        maxHp,
+        gang,
         dead: false,
         respawnT: 0,
         flash: 0,
@@ -167,15 +228,46 @@ export class Crowd {
         lungeDir: new THREE.Vector3(),
         attackCd: 1 + rnd() * 2,
         rockCd: 2 + rnd() * 3,
-        patrolT: this.thugSpawns[i].clone(),
+        patrolT: sp.clone(),
         kb: new THREE.Vector3(),
         phase: rnd() * 6,
         webT: 0,
         cocoon,
+        hpBar,
+        swingCd: 0,
       };
       rig.group.position.copy(t.spawn);
       scene.add(rig.group);
       this.thugs.push(t);
+    }
+
+    // ---- coins ----
+    const coinGeo = new THREE.CylinderGeometry(0.42, 0.42, 0.09, 16);
+    const coinMat = new THREE.MeshBasicMaterial({ color: 0xffcf3f });
+    const coinEdge = new THREE.MeshBasicMaterial({ color: 0xfff3b0 });
+    for (const spot of city.coinSpots) {
+      const g = new THREE.Group();
+      const c = new THREE.Mesh(coinGeo, coinMat);
+      c.rotation.z = Math.PI / 2;
+      g.add(c);
+      g.add(new THREE.Mesh(new THREE.TorusGeometry(0.42, 0.045, 8, 20), coinEdge).rotateY(Math.PI / 2));
+      g.position.copy(spot);
+      scene.add(g);
+      this.coins.push({ mesh: g, baseY: spot.y, phase: Math.random() * 7, taken: false });
+    }
+
+    // ---- heals ----
+    const healCore = new THREE.MeshBasicMaterial({ color: 0x52ffa8 });
+    for (const spot of city.healSpots) {
+      const g = new THREE.Group();
+      g.add(new THREE.Mesh(new THREE.OctahedronGeometry(0.5, 0), healCore));
+      const bar1 = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.22, 0.22), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+      const bar2 = bar1.clone();
+      bar2.rotation.z = Math.PI / 2;
+      g.add(bar1, bar2);
+      g.position.copy(spot);
+      scene.add(g);
+      this.heals.push({ mesh: g, baseY: spot.y, phase: Math.random() * 7, taken: false, respawn: 0 });
     }
 
     // ---- rock pool ----
@@ -244,6 +336,7 @@ export class Crowd {
   private groundAt(x: number, z: number): number {
     let g = 0;
     for (const b of this.city.boxes) {
+      if (b.y0 !== undefined) continue; // floating skybridges are not street ground
       if (x > b.cx - b.hx && x < b.cx + b.hx && z > b.cz - b.hz && z < b.cz + b.hz && b.top > g) g = b.top;
     }
     return g;
@@ -310,6 +403,75 @@ export class Crowd {
     }
     api.punches.length = 0;
 
+    /* ---- swing-through damage: slam into a thug at speed ---- */
+    const pSpeed = Math.hypot(api.playerVel.x, api.playerVel.z);
+    if (api.active && pSpeed > 15 && api.swingHitCd <= 0) {
+      for (const t of this.thugs) {
+        if (t.dead) continue;
+        const tp = t.rig.group.position;
+        const dx = tp.x - pp.x;
+        const dy = tp.y + 1 - pp.y;
+        const dz = tp.z - pp.z;
+        if (dx * dx + dy * dy + dz * dz > 2.6 * 2.6) continue;
+        const dmg = Math.round(pSpeed * 1.6);
+        t.hp -= dmg;
+        t.flash = 1;
+        t.stagger = 0.5;
+        t.windup = 0;
+        t.lungeT = 0;
+        t.kb.set(api.playerVel.x, 6, api.playerVel.z).multiplyScalar(0.55);
+        api.particles.burst(_v1.set(tp.x, tp.y + 1.2, tp.z), 16, ["#ffffff", "#35e0ff", "#ffcf3f"], 9, 0.5, 2.6);
+        if (t.hp <= 0) {
+          t.dead = true;
+          t.webT = 0;
+          t.cocoon.visible = false;
+          t.respawnT = 16;
+          t.rig.group.visible = false;
+          api.particles.burst(_v1.set(tp.x, tp.y + 1, tp.z), 30, [t.gang.color, "#ffcf3f", "#ffffff"], 11, 1, 3);
+          api.sfx.thugDie();
+          api.onThugKilled(_v1.set(tp.x, tp.y + 1.4, tp.z).clone());
+          api.onSwingHit(Math.round(t.gang.bounty * 1.5), _v1.set(tp.x, tp.y + 2, tp.z).clone());
+        } else {
+          api.onSwingHit(Math.round(dmg * 2), _v1.set(tp.x, tp.y + 1.6, tp.z).clone());
+        }
+        break; // one thug per swing tick
+      }
+    }
+
+    /* ---- coins ---- */
+    for (const c of this.coins) {
+      if (c.taken) continue;
+      c.mesh.rotation.y += 3.4 * dt;
+      c.mesh.position.y = c.baseY + Math.sin(api.elapsed * 2.4 + c.phase) * 0.25;
+      const m = c.mesh.position;
+      if (api.active && Math.abs(m.x - pp.x) < 1.7 && Math.abs(m.z - pp.z) < 1.7 && Math.abs(m.y - pp.y) < 2.6) {
+        c.taken = true;
+        c.mesh.visible = false;
+        api.onCoin(_v1.copy(m).clone());
+      }
+    }
+
+    /* ---- heals ---- */
+    for (const h of this.heals) {
+      if (h.taken) {
+        h.respawn -= dt;
+        if (h.respawn <= 0) {
+          h.taken = false;
+          h.mesh.visible = true;
+        }
+        continue;
+      }
+      h.mesh.rotation.y += 2 * dt;
+      h.mesh.position.y = h.baseY + Math.sin(api.elapsed * 2 + h.phase) * 0.2;
+      const m = h.mesh.position;
+      if (api.active && Math.abs(m.x - pp.x) < 1.8 && Math.abs(m.z - pp.z) < 1.8 && Math.abs(m.y - pp.y) < 2.8) {
+        h.taken = true;
+        h.mesh.visible = false;
+        h.respawn = 24;
+        api.onHeal(_v1.copy(m).clone());
+      }
+    }
+
     /* ---- civilians ---- */
     for (const c of this.civs) {
       const gpos = c.rig.group.position;
@@ -351,7 +513,7 @@ export class Crowd {
         t.respawnT -= dt;
         if (t.respawnT <= 0) {
           t.dead = false;
-          t.hp = THUG_HP;
+          t.hp = t.maxHp;
           t.rig.group.visible = true;
           t.rig.group.position.copy(t.spawn);
           t.rig.group.scale.setScalar(0.01);
@@ -363,6 +525,12 @@ export class Crowd {
       t.flash = Math.max(0, t.flash - dt * 4);
       const torsoMat = t.rig.torso.material as THREE.MeshToonMaterial;
       torsoMat.emissive.setRGB(t.flash * 0.9, t.flash * 0.2, t.flash * 0.2);
+      // gang HP bar overhead, fades out at full health
+      const hpPct = Math.max(0, t.hp / t.maxHp);
+      t.hpBar.scale.x = hpPct;
+      t.hpBar.visible = hpPct < 0.999;
+      t.hpBar.lookAt(pp.x, gpos.y + t.hpBar.position.y, pp.z);
+      t.swingCd = Math.max(0, t.swingCd - dt);
 
       const dx = pp.x - gpos.x;
       const dy = pp.y - gpos.y;
@@ -401,8 +569,8 @@ export class Crowd {
       }
       t.rig.group.rotation.z *= 0.8;
 
-      // face the player when aware
-      if (dist < 40 && dh > 0.1) {
+      // face the player when aware (gang aggro radius)
+      if (dist < t.gang.aggro && dh > 0.1) {
         const want = Math.atan2(dx, dz);
         let dyw = want - t.rig.group.rotation.y;
         while (dyw > Math.PI) dyw -= Math.PI * 2;
@@ -437,7 +605,7 @@ export class Crowd {
         t.rig.armL.rotation.x = -1.5;
         t.rig.armR.rotation.x = -1.5;
         if (dist < 1.7 && !api.invuln) {
-          api.damagePlayer(12, gpos);
+          api.damagePlayer(t.gang.dmg, gpos);
           t.lungeT = 0;
         }
         if (t.lungeT <= 0) {
@@ -453,7 +621,7 @@ export class Crowd {
       if (dh < 3.6 && Math.abs(dy) < 2.4 && t.attackCd <= 0) {
         t.windup = 0.45;
         api.sfx.grunt();
-      } else if (dist > 9 && dist < 46 && t.rockCd <= 0) {
+      } else if (dist > 9 && dist < t.gang.aggro + 8 && t.rockCd <= 0) {
         this.throwRock(t, api);
         t.rockCd = 2.8 + Math.random() * 2.4;
       } else {
@@ -502,7 +670,7 @@ export class Crowd {
       return;
     }
     d.normalize();
-    gpos.addScaledVector(d, 1.6 * dt);
+    gpos.addScaledVector(d, t.gang.speed * 0.8 * dt);
     gpos.y = this.groundAt(gpos.x, gpos.z);
     const want = Math.atan2(d.x, d.z);
     let dyw = want - t.rig.group.rotation.y;

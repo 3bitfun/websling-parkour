@@ -148,7 +148,7 @@ export function Hud({ hud }: { hud: HudData }) {
       )}
 
       {/* score + combo */}
-      <div className="absolute top-4 left-4 flex flex-col gap-2">
+      <div className="hud-left absolute top-4 left-4 flex flex-col gap-2">
         <div className="panel px-5 py-2.5">
           <div className="text-[10px] font-bold tracking-[0.3em] text-web/80">SCORE</div>
           <div key={hud.score} className="score-pop font-display text-4xl leading-none text-white text-outline-thin tabular-nums">
@@ -181,7 +181,7 @@ export function Hud({ hud }: { hud: HudData }) {
       </div>
 
       {/* right column: timer / tokens / leaderboard / mute */}
-      <div className="absolute top-4 right-4 flex flex-col items-end gap-2">
+      <div className="hud-right absolute top-4 right-4 flex flex-col items-end gap-2">
         {hud.mode === "free" ? (
           <div className="panel panel-red px-5 py-2.5 text-right">
             <div className="text-[10px] font-bold tracking-[0.3em] text-spidey/90">MODE</div>
@@ -239,7 +239,7 @@ export function Hud({ hud }: { hud: HudData }) {
       </div>
 
       {/* speed + alt */}
-      <div className="absolute bottom-5 left-4 flex flex-col gap-2 w-56">
+      <div className="hud-left absolute bottom-5 left-4 flex flex-col gap-2 w-56">
         <div className="panel px-4 py-2.5">
           <div className="flex justify-between text-[10px] font-bold tracking-[0.25em] text-web/80">
             <span>VELOCITY</span>
@@ -311,7 +311,7 @@ export function Hud({ hud }: { hud: HudData }) {
       {hud.hp < 100 && <div key={`hp-${Math.round(hud.hp / 10)}`} className="absolute inset-0 pointer-events-none damage-vignette" style={{ opacity: (100 - hud.hp) / 160 }} />}
 
       {/* contextual hint */}
-      <div className="absolute bottom-5 left-1/2 -translate-x-1/2 text-center">
+      <div className="fine-only absolute bottom-5 left-1/2 -translate-x-1/2 text-center">
         <div
           key={hud.attached ? "a" : hud.climbing ? "c" : hud.gliding ? "g" : hud.sliding ? "s" : hud.speed > 2 ? "m" : "i"}
           className="anim-rise font-display text-xl tracking-wider text-outline-thin whitespace-nowrap"
@@ -334,7 +334,7 @@ export function Hud({ hud }: { hud: HudData }) {
       </div>
 
       {/* mini controls */}
-      <div className="absolute bottom-5 right-4 flex flex-col gap-1 text-[10px] text-web/70 font-semibold tracking-wider text-right">
+      <div className="kb-only absolute bottom-5 right-4 flex flex-col gap-1 text-[10px] text-web/70 font-semibold tracking-wider text-right">
         <div><span className="text-white/80">SHIFT</span> RUN · <span className="text-white/80">CTRL/C</span> SLIDE · <span className="text-white/80">F</span> DASH · <span className="text-white/80">V</span> PUNCH</div>
         <div><span className="text-white/80">LMB/Q</span> SWING · <span className="text-white/80">X</span> WEB-SHOT · <span className="text-white/80">RMB/E</span> GLIDE · <span className="text-white/80">WALL</span> CLIMB</div>
       </div>

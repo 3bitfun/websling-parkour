@@ -171,6 +171,20 @@ export async function fetchLeaderboard(mode: "solo" | "free" | "versus" | "all")
   }));
 }
 
+/* ---------------- coins (persistent wallet) ---------------- */
+
+export async function fetchCoins(uid: string): Promise<number> {
+  const { data } = await client().from("websling_profiles").select("coins").eq("user_id", uid).maybeSingle();
+  return Number((data as { coins?: number } | null)?.coins ?? 0);
+}
+
+export async function addCoins(uid: string, amount: number): Promise<number> {
+  if (amount <= 0) return 0;
+  const { data, error } = await client().rpc("websling_add_coins", { p_amount: amount });
+  if (error) throw new Error(friendly(error.message));
+  return Number(data ?? 0);
+}
+
 export async function fetchMyBest(mode: "solo" | "free" | "versus" | "all", uid: string): Promise<number | null> {
   let q = client().from("websling_scores").select("score").eq("user_id", uid);
   if (mode !== "all") q = q.eq("mode", mode);

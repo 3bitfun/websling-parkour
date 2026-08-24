@@ -207,12 +207,12 @@ export function spiderStyle(): RigStyle {
   };
 }
 
-export function thugStyle(): RigStyle {
+export function thugStyle(gang?: { torso: number; arms: number; legs: number }): RigStyle {
   return {
     head: 0xffffff,
-    torso: 0x232733,
-    arms: 0x2c3140,
-    legs: 0x1b1f2b,
+    torso: gang?.torso ?? 0x232733,
+    arms: gang?.arms ?? 0x2c3140,
+    legs: gang?.legs ?? 0x1b1f2b,
     faceTex: thugFaceTex(),
   };
 }

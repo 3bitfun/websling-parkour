@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Engine,
   type HudData,
@@ -33,6 +33,7 @@ import {
   StartScreen,
   Toast,
 } from "./components/ui";
+import { MobileControls } from "./components/MobileControls";
 
 const BEST_KEY = "webrunner-best-score";
 const NAME_KEY = "webrunner-name";
@@ -80,6 +81,14 @@ export default function App() {
   });
   const [isNewBest, setIsNewBest] = useState(false);
   const [muted, setMuted] = useState(false);
+
+  // touch device? show the on-screen controls
+  const isTouch = useMemo(
+    () =>
+      typeof window !== "undefined" &&
+      (window.matchMedia("(pointer: coarse)").matches || "ontouchstart" in window),
+    []
+  );
 
   // versus lobby state
   const [lobbyOpen, setLobbyOpen] = useState(false);
@@ -279,6 +288,9 @@ export default function App() {
 
       {(phase === "playing" || phase === "paused") && <Hud hud={hud} />}
       {phase === "playing" && <Popups popups={popups} />}
+      {isTouch && phase === "playing" && engineRef.current && (
+        <MobileControls engine={engineRef.current} />
+      )}
 
       {phase === "menu" && lobbyOpen && (
         <LobbyScreen

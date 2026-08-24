@@ -244,3 +244,73 @@ canvas {
   -webkit-text-stroke: 1px rgba(7, 11, 34, 0.9);
   paint-order: stroke fill;
 }
+
+/* ---------- touch controls ---------- */
+.t-btn {
+  width: 62px;
+  height: 62px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  font-family: var(--font-display);
+  font-size: 15px;
+  letter-spacing: 0.08em;
+  color: #ffffff;
+  background: rgba(13, 20, 51, 0.72);
+  border: 2px solid rgba(53, 224, 255, 0.65);
+  box-shadow:
+    0 0 0 2px rgba(7, 11, 34, 0.85),
+    0 4px 0 rgba(7, 11, 34, 0.9),
+    0 0 18px rgba(53, 224, 255, 0.22);
+  -webkit-text-stroke: 1px rgba(7, 11, 34, 0.9);
+  paint-order: stroke fill;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: transform 0.08s ease, background 0.08s ease;
+}
+.t-btn:active,
+.t-btn[data-held="1"] {
+  transform: translateY(3px) scale(0.94);
+  background: rgba(255, 36, 56, 0.75);
+  border-color: #ff2438;
+  box-shadow:
+    0 0 0 2px rgba(7, 11, 34, 0.85),
+    0 1px 0 rgba(7, 11, 34, 0.9),
+    0 0 22px rgba(255, 36, 56, 0.5);
+}
+.t-btn-big {
+  width: 88px;
+  height: 88px;
+  font-size: 22px;
+  border-color: rgba(255, 36, 56, 0.85);
+  background: rgba(120, 18, 30, 0.66);
+  box-shadow:
+    0 0 0 2px rgba(7, 11, 34, 0.85),
+    0 5px 0 rgba(7, 11, 34, 0.9),
+    0 0 26px rgba(255, 36, 56, 0.4);
+}
+.t-btn-sm {
+  width: 52px;
+  height: 52px;
+  font-size: 12px;
+}
+.t-btn-cyan { border-color: rgba(53, 224, 255, 0.85); }
+.t-btn-mint { border-color: rgba(82, 255, 168, 0.85); }
+.t-btn-gold { border-color: rgba(255, 207, 63, 0.85); }
+.t-btn-red { border-color: rgba(255, 36, 56, 0.9); }
+
+/* ---------- small-screen / touch HUD tweaks ---------- */
+.hud-left { transform-origin: top left; }
+.hud-right { transform-origin: top right; }
+@media (pointer: coarse) {
+  .kb-only,
+  .fine-only { display: none !important; }
+  .hud-left,
+  .hud-right { transform: scale(0.85); }
+}
+@media (max-width: 700px) {
+  .hud-left,
+  .hud-right { transform: scale(0.72); }
+}
