@@ -144,6 +144,21 @@ export class Sfx {
     this.tone(930, 0.14, "sine", 0.16, undefined, 0.07);
   }
 
+  /* ---------- web throw + wall climb ---------- */
+  webShot() {
+    this.noise(0.1, 2400, 0.2, 2, 4200);
+    this.tone(900, 0.08, "square", 0.1, 1800);
+  }
+  webImpact() {
+    this.noise(0.12, 1400, 0.26, 1.4, 2600);
+    this.tone(520, 0.1, "sine", 0.2, 200);
+    this.tone(1400, 0.06, "square", 0.1, 500, 0.03);
+  }
+  webGrab() {
+    this.noise(0.1, 1100, 0.2, 1.6, 2000);
+    this.tone(300, 0.12, "sine", 0.18, 500);
+  }
+
   slide() {
     this.noise(0.34, 1600, 0.24, 1.4, 420);
     this.tone(300, 0.2, "triangle", 0.1, 130);

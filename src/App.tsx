@@ -54,6 +54,7 @@ const initialHud: HudData = {
   roomCode: null,
   sliding: false,
   gliding: false,
+  climbing: false,
   dashReady: true,
   hp: 100,
   punchCombo: 0,

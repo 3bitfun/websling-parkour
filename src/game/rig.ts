@@ -16,8 +16,16 @@ export interface RigStyle {
   torso: number;
   arms: number;
   legs: number;
+  /** Wrap texture applied to every head face (e.g. spider webbing). */
   headTex?: THREE.Texture | null;
+  /** Transparent face overlay applied to the FRONT head face only (civ/thug). */
+  faceTex?: THREE.Texture | null;
+  /** Wrap texture for the torso (spider webbing). */
   torsoTex?: THREE.Texture | null;
+  /** Wrap texture for the arms (spider webbing). */
+  armTex?: THREE.Texture | null;
+  /** Spider: adds 3D white eye lenses + a chest emblem. */
+  spider?: boolean;
 }
 
 /* ---------- shared resources ---------- */
@@ -36,11 +44,13 @@ function getGradient(): THREE.DataTexture {
   return gradientMap;
 }
 
-export function toonMat(color: number, map?: THREE.Texture | null): THREE.MeshToonMaterial {
+export function toonMat(color: number, map?: THREE.Texture | null, transparent = false): THREE.MeshToonMaterial {
   return new THREE.MeshToonMaterial({
     color,
     map: map ?? undefined,
     gradientMap: getGradient(),
+    transparent,
+    alphaTest: transparent ? 0.05 : 0,
   });
 }
 
@@ -61,9 +71,9 @@ function canvasTex(size: number, draw: (c: CanvasRenderingContext2D, s: number) 
   return t;
 }
 
-function webLines(c: CanvasRenderingContext2D, s: number, step: number, color: string) {
+function webGrid(c: CanvasRenderingContext2D, s: number, step: number, color: string) {
   c.strokeStyle = color;
-  c.lineWidth = Math.max(1.5, s / 64);
+  c.lineWidth = Math.max(1.5, s / 72);
   for (let i = 0; i <= s; i += step) {
     c.beginPath();
     c.moveTo(i, 0);
@@ -76,85 +86,63 @@ function webLines(c: CanvasRenderingContext2D, s: number, step: number, color: s
   }
 }
 
-let _spiderHead: THREE.Texture | null = null;
-export function spiderHeadTex(): THREE.Texture {
-  if (_spiderHead) return _spiderHead;
-  _spiderHead = canvasTex(128, (c, s) => {
-    c.fillStyle = "#e6273a";
+let _redWeb: THREE.Texture | null = null;
+export function redWebTex(): THREE.Texture {
+  if (_redWeb) return _redWeb;
+  _redWeb = canvasTex(128, (c, s) => {
+    c.fillStyle = "#d81f30";
     c.fillRect(0, 0, s, s);
-    webLines(c, s, 14, "rgba(20,8,14,0.65)");
-    // big white lenses (front face)
-    c.fillStyle = "#f4fbff";
-    c.save();
-    c.translate(s * 0.3, s * 0.46);
-    c.rotate(-0.32);
-    c.beginPath();
-    c.ellipse(0, 0, s * 0.155, s * 0.21, 0, 0, Math.PI * 2);
-    c.fill();
-    c.restore();
-    c.save();
-    c.translate(s * 0.7, s * 0.46);
-    c.rotate(0.32);
-    c.beginPath();
-    c.ellipse(0, 0, s * 0.155, s * 0.21, 0, 0, Math.PI * 2);
-    c.fill();
-    c.restore();
-    c.strokeStyle = "rgba(10,10,20,0.8)";
-    c.lineWidth = 3;
-    c.save();
-    c.translate(s * 0.3, s * 0.46);
-    c.rotate(-0.32);
-    c.beginPath();
-    c.ellipse(0, 0, s * 0.155, s * 0.21, 0, 0, Math.PI * 2);
-    c.stroke();
-    c.restore();
-    c.save();
-    c.translate(s * 0.7, s * 0.46);
-    c.rotate(0.32);
-    c.beginPath();
-    c.ellipse(0, 0, s * 0.155, s * 0.21, 0, 0, Math.PI * 2);
-    c.stroke();
-    c.restore();
+    webGrid(c, s, 13, "rgba(40,4,12,0.6)");
   });
-  return _spiderHead;
+  return _redWeb;
 }
 
-let _spiderTorso: THREE.Texture | null = null;
-export function spiderTorsoTex(): THREE.Texture {
-  if (_spiderTorso) return _spiderTorso;
-  _spiderTorso = canvasTex(128, (c, s) => {
-    c.fillStyle = "#2447c9";
+let _blueWeb: THREE.Texture | null = null;
+export function blueWebTex(): THREE.Texture {
+  if (_blueWeb) return _blueWeb;
+  _blueWeb = canvasTex(128, (c, s) => {
+    c.fillStyle = "#2040b8";
     c.fillRect(0, 0, s, s);
-    webLines(c, s, 15, "rgba(8,10,30,0.55)");
-    // spider emblem
-    c.fillStyle = "#0d1024";
+    webGrid(c, s, 15, "rgba(6,10,40,0.55)");
+  });
+  return _blueWeb;
+}
+
+/** Transparent black spider emblem for the chest plane. */
+let _emblem: THREE.Texture | null = null;
+export function spiderEmblemTex(): THREE.Texture {
+  if (_emblem) return _emblem;
+  _emblem = canvasTex(128, (c, s) => {
+    c.clearRect(0, 0, s, s);
     const cx = s / 2;
-    const cy = s * 0.42;
-    c.beginPath();
-    c.ellipse(cx, cy, s * 0.05, s * 0.09, 0, 0, Math.PI * 2);
-    c.fill();
-    c.beginPath();
-    c.arc(cx, cy - s * 0.1, s * 0.035, 0, Math.PI * 2);
-    c.fill();
-    c.strokeStyle = "#0d1024";
-    c.lineWidth = 3;
+    const cy = s * 0.46;
+    c.fillStyle = "#0b0e20";
+    c.strokeStyle = "#0b0e20";
+    c.lineWidth = s * 0.045;
+    c.lineCap = "round";
+    // legs
     for (let i = 0; i < 4; i++) {
-      const a = -0.9 + i * 0.6;
+      const a = -1.1 + i * 0.72;
+      const lx = Math.cos(a) * s * 0.3;
+      const ly = Math.sin(a) * s * 0.26 - s * 0.04;
       c.beginPath();
       c.moveTo(cx, cy);
-      c.quadraticCurveTo(cx + Math.cos(a) * s * 0.14, cy + Math.sin(a) * s * 0.1 - s * 0.05, cx + Math.cos(a) * s * 0.22, cy + Math.sin(a) * s * 0.2);
+      c.quadraticCurveTo(cx + lx * 0.5, cy + ly - s * 0.1, cx + lx, cy + ly);
       c.stroke();
       c.beginPath();
       c.moveTo(cx, cy);
-      c.quadraticCurveTo(cx - Math.cos(a) * s * 0.14, cy + Math.sin(a) * s * 0.1 - s * 0.05, cx - Math.cos(a) * s * 0.22, cy + Math.sin(a) * s * 0.2);
+      c.quadraticCurveTo(cx - lx * 0.5, cy + ly - s * 0.1, cx - lx, cy + ly);
       c.stroke();
     }
-    // red side panels
-    c.fillStyle = "#e6273a";
-    c.fillRect(0, 0, s * 0.08, s);
-    c.fillRect(s * 0.92, 0, s * 0.08, s);
+    // body + head
+    c.beginPath();
+    c.ellipse(cx, cy + s * 0.05, s * 0.09, s * 0.16, 0, 0, Math.PI * 2);
+    c.fill();
+    c.beginPath();
+    c.arc(cx, cy - s * 0.13, s * 0.07, 0, Math.PI * 2);
+    c.fill();
   });
-  return _spiderTorso;
+  return _emblem;
 }
 
 let _civFace: THREE.Texture | null = null;
@@ -181,9 +169,8 @@ let _thugFace: THREE.Texture | null = null;
 export function thugFaceTex(): THREE.Texture {
   if (_thugFace) return _thugFace;
   _thugFace = canvasTex(64, (c, s) => {
-    c.fillStyle = "#ffffff";
+    c.fillStyle = "#e8e8f0";
     c.fillRect(0, 0, s, s);
-    // angry glowing eyes
     c.fillStyle = "#ff2438";
     c.save();
     c.translate(s * 0.33, s * 0.44);
@@ -195,7 +182,6 @@ export function thugFaceTex(): THREE.Texture {
     c.rotate(-0.35);
     c.fillRect(-s * 0.11, -s * 0.035, s * 0.22, s * 0.07);
     c.restore();
-    // scowl
     c.strokeStyle = "#1a1020";
     c.lineWidth = s * 0.05;
     c.lineCap = "round";
@@ -212,20 +198,22 @@ export function spiderStyle(): RigStyle {
   return {
     head: 0xffffff,
     torso: 0xffffff,
-    arms: 0xd21f2e,
-    legs: 0xd21f2e,
-    headTex: spiderHeadTex(),
-    torsoTex: spiderTorsoTex(),
+    arms: 0xffffff,
+    legs: 0x2743b0,
+    headTex: redWebTex(),
+    torsoTex: blueWebTex(),
+    armTex: redWebTex(),
+    spider: true,
   };
 }
 
 export function thugStyle(): RigStyle {
   return {
-    head: 0x9aa0b8,
+    head: 0xffffff,
     torso: 0x232733,
     arms: 0x2c3140,
     legs: 0x1b1f2b,
-    headTex: thugFaceTex(),
+    faceTex: thugFaceTex(),
   };
 }
 
@@ -239,25 +227,55 @@ export function civStyle(rnd: () => number): RigStyle {
     torso: CIV_TORSO[Math.floor(rnd() * CIV_TORSO.length)],
     arms: CIV_SKIN[Math.floor(rnd() * CIV_SKIN.length)],
     legs: CIV_LEGS[Math.floor(rnd() * CIV_LEGS.length)],
-    headTex: civFaceTex(),
+    faceTex: civFaceTex(),
   };
 }
 
 /* ---------- builder ---------- */
 
+const eyeMat = new THREE.MeshBasicMaterial({ color: 0xf6fcff });
+const emblemGeo = new THREE.PlaneGeometry(0.62 * S * 2, 0.72 * S * 2);
+let emblemMat: THREE.MeshBasicMaterial | null = null;
+function getEmblemMat(): THREE.MeshBasicMaterial {
+  if (!emblemMat)
+    emblemMat = new THREE.MeshBasicMaterial({ map: spiderEmblemTex(), transparent: true, alphaTest: 0.1, depthWrite: false });
+  return emblemMat;
+}
+
 export function buildR6Rig(style: RigStyle): Rig {
   const g = new THREE.Group();
 
-  const headMat = toonMat(style.head, style.headTex ?? null);
   const torsoMat = toonMat(style.torso, style.torsoTex ?? null);
-  const armMat = toonMat(style.arms);
+  const armMat = toonMat(style.arms, style.armTex ?? null);
   const legMat = toonMat(style.legs);
 
   const torso = new THREE.Mesh(geoTorso, torsoMat);
   torso.position.y = 3 * S; // studs 2..4
 
-  const head = new THREE.Mesh(geoHead, headMat);
+  // Head: single wrap material, or a 6-material box with the face on the front (+z).
+  let head: THREE.Mesh;
+  if (style.faceTex) {
+    const base = toonMat(style.head);
+    const front = toonMat(style.head, style.faceTex, true);
+    head = new THREE.Mesh(geoHead, [base, base, base, base, front, base]);
+  } else {
+    head = new THREE.Mesh(geoHead, toonMat(style.head, style.headTex ?? null));
+  }
   head.position.y = 4.6 * S; // studs 4..5.2
+
+  // Spider: 3D white eye lenses on the front of the mask.
+  if (style.spider) {
+    const eyeGeo = new THREE.BoxGeometry(0.34 * S, 0.62 * S, 0.06 * S);
+    const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+    eyeL.position.set(-0.3 * S, 4.66 * S, 0.62 * S);
+    eyeL.rotation.z = 0.42;
+    const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
+    eyeR.position.set(0.3 * S, 4.66 * S, 0.62 * S);
+    eyeR.rotation.z = -0.42;
+    const emblem = new THREE.Mesh(emblemGeo, getEmblemMat());
+    emblem.position.set(0, 3.25 * S, 0.52 * S);
+    g.add(eyeL, eyeR, emblem);
+  }
 
   const limb = (geo: THREE.BoxGeometry, mat: THREE.Material) => {
     const pivot = new THREE.Group();

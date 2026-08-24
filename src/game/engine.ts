@@ -42,6 +42,7 @@ export interface HudData {
   roomCode: string | null;
   sliding: boolean;
   gliding: boolean;
+  climbing: boolean;
   dashReady: boolean;
   hp: number;
   punchCombo: number;
@@ -277,6 +278,19 @@ export class Engine {
   private glider!: THREE.Group;
   private gliderS = 0;
 
+  // wall climbing
+  private climbing = false;
+  private wallN = new THREE.Vector3(1, 0, 0);
+  private wallBox: Box | null = null;
+  private touchWallN = new THREE.Vector3();
+  private touchWallBox: Box | null = null;
+  private touchWallT = 0;
+
+  // web projectiles
+  private webShots: { p: THREE.Vector3; v: THREE.Vector3; life: number; mesh: THREE.Mesh; line: THREE.Line }[] = [];
+  private webShotCd = 0;
+  private webShotGeo = new THREE.SphereGeometry(0.24, 10, 8);
+
   // scene objects
   private player!: THREE.Group;
   private rig!: Rig;
@@ -369,6 +383,9 @@ export class Engine {
         this.mouseWeb = true;
         this.refireT = 0;
         this.tryWeb();
+      } else if (e.button === 1) {
+        e.preventDefault();
+        this.tryWebShot();
       } else if (e.button === 2) this.glideHeld = true;
     };
     this.onMouseUp = (e) => {
@@ -485,7 +502,8 @@ export class Engine {
     attached: boolean,
     k: number,
     sliding = false,
-    gliding = false
+    gliding = false,
+    climbing = false
   ) {
     let armX = 0.15;
     let armZL = 0.12;
@@ -493,7 +511,15 @@ export class Engine {
     let legX = 0;
     let legZ = 0.08;
     const run = grounded && hs > 3;
-    if (attached) {
+    if (climbing) {
+      // clinging to the wall: arms reach up to grip, knees bent against the face
+      const cycle = Math.sin(this.elapsed * 10) * Math.min(1, Math.abs(this.vel.y) / 6);
+      armX = -2.8;
+      armZL = 0.4;
+      armZR = -0.4;
+      legX = 0.95 + cycle * 0.25;
+      legZ = 0.5;
+    } else if (attached) {
       armX = -2.75;
       armZL = 0.25;
       armZR = -0.25;
@@ -628,6 +654,7 @@ export class Engine {
     }
     this.authUnsub?.();
     this.authUnsub = null;
+    this.clearWebShots();
     if (this.crowd) this.crowd.dispose();
     cancelAnimationFrame(this.raf);
     window.removeEventListener("resize", this.onResize);
@@ -698,6 +725,11 @@ export class Engine {
     this.hitFlash = 0;
     this.punchCooldown = 0;
     this.punches.length = 0;
+    this.climbing = false;
+    this.wallBox = null;
+    this.touchWallT = 0;
+    this.webShotCd = 0;
+    this.clearWebShots();
     if (this.crowd) this.crowd.reset();
     this.time = RUN_TIME;
     this.collected = 0;
@@ -777,6 +809,7 @@ export class Engine {
       if (e.code === "KeyF" && !e.repeat) this.tryDash();
       if (e.code === "KeyE") this.glideHeld = true;
       if ((e.code === "KeyV" || e.code === "KeyB") && !e.repeat) this.tryPunch();
+      if (e.code === "KeyX" && !e.repeat) this.tryWebShot();
     }
     if (e.code === "KeyM" && !e.repeat) this.toggleMute();
     if (e.code === "KeyR" && this.phase === "playing" && !e.repeat) {
@@ -815,6 +848,11 @@ export class Engine {
     const d = this.pos.distanceTo(this.anchor);
     this.ropeLen = THREE.MathUtils.clamp(d * 0.97, 7, 58);
     this.attached = true;
+    if (this.climbing) {
+      // launching off the wall into a swing
+      this.climbing = false;
+      this.vel.addScaledVector(this.wallN, 4);
+    }
     this.attachT = 0;
     this.touchGroundDuringSwing = false;
     this.swingFrom.copy(this.pos);
@@ -970,6 +1008,146 @@ export class Engine {
     }
   }
 
+  /* ---------------- wall climbing ---------------- */
+  private handleClimb(h: number) {
+    const b = this.wallBox;
+    if (!b) {
+      this.climbing = false;
+      return;
+    }
+    // wall-jump: kick off away from the face
+    if (this.jumpBufT > 0) {
+      this.jumpBufT = 0;
+      this.climbing = false;
+      this.vel.set(this.wallN.x * 13, 15.5, this.wallN.z * 13);
+      this.grounded = false;
+      this.sfx.jump();
+      this.particles.burst(this.pos, 12, ["#aef3ff", "#ffffff"], 6, 0.5, 2);
+      return;
+    }
+    let vy = 0;
+    if (this.keys.has("KeyW")) vy += 7.2;
+    if (this.keys.has("KeyS")) vy -= 6.2;
+    const tang = _t.set(-this.wallN.z, 0, this.wallN.x);
+    let st = 0;
+    if (this.keys.has("KeyD")) st += 1;
+    if (this.keys.has("KeyA")) st -= 1;
+    const vt = st * 5.2;
+
+    this.pos.addScaledVector(tang, vt * h);
+    this.pos.y += vy * h;
+
+    // stay glued to the wall surface
+    if (Math.abs(this.wallN.x) > 0.5) this.pos.x = b.cx + this.wallN.x * (b.hx + R);
+    else this.pos.z = b.cz + this.wallN.z * (b.hz + R);
+    if (Math.abs(this.wallN.x) > 0.5) this.pos.z = THREE.MathUtils.clamp(this.pos.z, b.cz - b.hz - R, b.cz + b.hz + R);
+    else this.pos.x = THREE.MathUtils.clamp(this.pos.x, b.cx - b.hx - R, b.cx + b.hx + R);
+
+    // mantle over the ledge
+    if (this.pos.y > b.top + R * 0.35) {
+      this.pos.y = b.top + R;
+      this.climbing = false;
+      this.grounded = true;
+      this.vel.set(0, 2.5, 0);
+      this.sfx.jump();
+      this.particles.burst(this.pos, 8, ["#aef3ff", "#ffffff"], 3.5, 0.4, 1.6);
+      return;
+    }
+    if (this.pos.y <= R) {
+      this.pos.y = R;
+      this.climbing = false;
+      this.grounded = true;
+      this.vel.set(0, 0, 0);
+      return;
+    }
+    this.vel.set(tang.x * vt, vy, tang.z * vt);
+    this.grounded = false;
+    this.coyoteT = 0.12;
+  }
+
+  /* ---------------- web projectiles ---------------- */
+  private tryWebShot() {
+    if (this.phase !== "playing" || this.countdown > 0 || this.webShotCd > 0) return;
+    this.webShotCd = 0.22;
+    const dir = this.aimDir(new THREE.Vector3());
+    const origin = new THREE.Vector3().copy(this.pos);
+    origin.y += 0.6;
+    origin.addScaledVector(dir, 0.9);
+    const mesh = new THREE.Mesh(this.webShotGeo, new THREE.MeshBasicMaterial({ color: 0xf6fcff }));
+    mesh.position.copy(origin);
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3).setUsage(THREE.DynamicDrawUsage));
+    const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xf2fbff, transparent: true, opacity: 0.9 }));
+    line.frustumCulled = false;
+    this.scene.add(mesh, line);
+    this.webShots.push({ p: origin, v: dir.multiplyScalar(48).addScaledVector(this.vel, 0.35), life: 1.05, mesh, line });
+    this.sfx.webShot();
+    this.particles.burst(origin, 6, ["#f2fbff", "#aef3ff"], 3, 0.3, 1.4);
+  }
+
+  private clearWebShots() {
+    for (const s of this.webShots) {
+      this.scene.remove(s.mesh, s.line);
+      (s.mesh.material as THREE.Material).dispose();
+      (s.line.material as THREE.Material).dispose();
+      s.line.geometry.dispose();
+    }
+    this.webShots.length = 0;
+  }
+
+  private updateWebShots(dt: number) {
+    const hand = _v.copy(this.pos);
+    hand.y += 0.9;
+    for (let i = this.webShots.length - 1; i >= 0; i--) {
+      const s = this.webShots[i];
+      s.life -= dt;
+      s.v.y -= 7 * dt;
+      s.p.addScaledVector(s.v, dt);
+      let done = false;
+      let hit = false;
+      if (this.crowd.webAt(s.p.x, s.p.y, s.p.z)) {
+        done = true;
+        hit = true;
+      } else if (s.p.y < 0.15) {
+        done = true;
+      } else {
+        for (const b of this.city.boxes) {
+          if (
+            s.p.x > b.cx - b.hx &&
+            s.p.x < b.cx + b.hx &&
+            s.p.z > b.cz - b.hz &&
+            s.p.z < b.cz + b.hz &&
+            s.p.y > 0 &&
+            s.p.y < b.top
+          ) {
+            done = true;
+            break;
+          }
+        }
+      }
+      if (done || s.life <= 0) {
+        if (hit) {
+          this.sfx.webImpact();
+          this.particles.burst(s.p, 16, ["#f2fbff", "#ffffff", "#aef3ff"], 6, 0.5, 2);
+          this.popupAt(s.p.clone(), "WEBBED", "cyan");
+        } else {
+          this.particles.burst(s.p, 5, ["#f2fbff"], 2.5, 0.3, 1.2);
+        }
+        this.scene.remove(s.mesh, s.line);
+        (s.mesh.material as THREE.Material).dispose();
+        (s.line.material as THREE.Material).dispose();
+        s.line.geometry.dispose();
+        this.webShots.splice(i, 1);
+        continue;
+      }
+      s.mesh.position.copy(s.p);
+      const arr = s.line.geometry.attributes.position as THREE.BufferAttribute;
+      arr.setXYZ(0, hand.x, hand.y, hand.z);
+      arr.setXYZ(1, s.p.x, s.p.y, s.p.z);
+      arr.needsUpdate = true;
+    }
+  }
+
   /* ---------------- physics ---------------- */
   private step(h: number) {
     // parkour timers
@@ -978,6 +1156,8 @@ export class Engine {
     this.slideCool = Math.max(0, this.slideCool - h);
     this.dashCd = Math.max(0, this.dashCd - h);
     this.dashT = Math.max(0, this.dashT - h);
+    this.touchWallT = Math.max(0, this.touchWallT - h);
+    this.webShotCd = Math.max(0, this.webShotCd - h);
 
     const fwdH = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
     const rightH = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
@@ -989,6 +1169,24 @@ export class Engine {
     if (wish.lengthSq() > 0) wish.normalize();
 
     const hs0 = Math.hypot(this.vel.x, this.vel.z);
+
+    // ---- wall climb ----
+    if (this.climbing) {
+      this.handleClimb(h);
+      return;
+    }
+    if (!this.grounded && !this.attached && !this.gliding && this.touchWallT > 0) {
+      const into = wish.dot(_n.copy(this.touchWallN).multiplyScalar(-1));
+      if (into > 0.3) {
+        this.climbing = true;
+        this.wallN.copy(this.touchWallN);
+        this.wallBox = this.touchWallBox;
+        this.vel.set(0, 0, 0);
+        this.sliding = false;
+        this.sfx.webGrab();
+        this.particles.burst(this.pos, 10, ["#f2fbff", "#aef3ff"], 4, 0.4, 1.8);
+      }
+    }
 
     // ---- slide state machine ----
     if (this.sliding) {
@@ -1147,6 +1345,11 @@ export class Engine {
         this.grounded = true;
         this.vel.x *= 0.995;
         this.vel.z *= 0.995;
+      } else if (Math.abs(ny) < 0.5) {
+        // remember the side wall we're pressed against (for climbing)
+        this.touchWallN.set(nx, 0, nz).normalize();
+        this.touchWallBox = b;
+        this.touchWallT = 0.14;
       }
     }
 
@@ -1322,6 +1525,7 @@ export class Engine {
       particles: this.particles,
       sfx: this.sfx,
     });
+    this.updateWebShots(dt);
 
     this.particles.update(dt);
     this.renderer.render(this.scene, this.camera);
@@ -1337,13 +1541,14 @@ export class Engine {
     this.player.visible = true;
     const hs = Math.hypot(this.vel.x, this.vel.z);
     let targetYaw = this.yaw;
-    if (hs > 2.5) targetYaw = Math.atan2(this.vel.x, this.vel.z);
+    if (this.climbing) targetYaw = Math.atan2(-this.wallN.x, -this.wallN.z);
+    else if (hs > 2.5) targetYaw = Math.atan2(this.vel.x, this.vel.z);
     let dy = targetYaw - this.player.rotation.y;
     while (dy > Math.PI) dy -= Math.PI * 2;
     while (dy < -Math.PI) dy += Math.PI * 2;
     this.player.rotation.y += dy * k;
 
-    this.applyPose(this.rig, hs, this.vel.y, this.grounded, this.attached, k, this.sliding, this.gliding);
+    this.applyPose(this.rig, hs, this.vel.y, this.grounded, this.attached, k, this.sliding, this.gliding, this.climbing);
 
     // punch animation: snap the striking arm forward
     if (this.attackAnim > 0 && !this.attached) {
@@ -1875,6 +2080,7 @@ export class Engine {
       roomCode: this.roomCode,
       sliding: this.sliding,
       gliding: this.gliding,
+      climbing: this.climbing,
       dashReady: this.dashCd <= 0,
       hp: this.hp,
       punchCombo: this.comboCount,

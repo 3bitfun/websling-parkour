@@ -173,9 +173,9 @@ export function Hud({ hud }: { hud: HudData }) {
             </span>
           </div>
         </div>
-        {(hud.sliding || hud.gliding) && (
-          <div key={hud.sliding ? "s" : "g"} className="anim-pop w-fit px-4 py-1 font-display text-lg tracking-widest text-outline-thin" style={{ background: hud.sliding ? "rgba(82,255,168,0.16)" : "rgba(53,224,255,0.14)", border: `2px solid ${hud.sliding ? "#52ffa8" : "#35e0ff"}`, color: hud.sliding ? "#52ffa8" : "#aef3ff", transform: "skewX(-6deg)" }}>
-            {hud.sliding ? "SLIDING" : "GLIDING"}
+        {(hud.sliding || hud.gliding || hud.climbing) && (
+          <div key={hud.climbing ? "c" : hud.sliding ? "s" : "g"} className="anim-pop w-fit px-4 py-1 font-display text-lg tracking-widest text-outline-thin" style={{ background: hud.climbing ? "rgba(255,79,216,0.16)" : hud.sliding ? "rgba(82,255,168,0.16)" : "rgba(53,224,255,0.14)", border: `2px solid ${hud.climbing ? "#ff4fd8" : hud.sliding ? "#52ffa8" : "#35e0ff"}`, color: hud.climbing ? "#ff9bea" : hud.sliding ? "#52ffa8" : "#aef3ff", transform: "skewX(-6deg)" }}>
+            {hud.climbing ? "CLIMBING" : hud.sliding ? "SLIDING" : "GLIDING"}
           </div>
         )}
       </div>
@@ -313,28 +313,30 @@ export function Hud({ hud }: { hud: HudData }) {
       {/* contextual hint */}
       <div className="absolute bottom-5 left-1/2 -translate-x-1/2 text-center">
         <div
-          key={hud.attached ? "a" : hud.gliding ? "g" : hud.sliding ? "s" : hud.speed > 2 ? "m" : "i"}
+          key={hud.attached ? "a" : hud.climbing ? "c" : hud.gliding ? "g" : hud.sliding ? "s" : hud.speed > 2 ? "m" : "i"}
           className="anim-rise font-display text-xl tracking-wider text-outline-thin whitespace-nowrap"
-          style={{ color: hud.attached ? "#ffcf3f" : hud.gliding ? "#52ffa8" : "rgba(174,243,255,0.85)" }}
+          style={{ color: hud.attached ? "#ffcf3f" : hud.climbing ? "#ff9bea" : hud.gliding ? "#52ffa8" : "rgba(174,243,255,0.85)" }}
         >
           {hud.attached
             ? "RELEASE TO FLY!"
-            : hud.gliding
-              ? "GLIDING — SOFT LANDING SAVES YOUR COMBO"
-              : hud.sliding
-                ? "SPACE OUT OF THE SLIDE!"
-                : hud.punchCombo >= 2
-                  ? "KEEP THE PUNCH COMBO GOING!"
-                  : hud.speed > 2
-                    ? "LMB / Q WEB · RMB / E GLIDE · V PUNCH"
-                    : "SHIFT RUN · CTRL SLIDE · SPACE JUMP · F DASH · V PUNCH"}
+            : hud.climbing
+              ? "W/S CLIMB · A/D SHIMMY · SPACE WALL-JUMP"
+              : hud.gliding
+                ? "GLIDING — SOFT LANDING SAVES YOUR COMBO"
+                : hud.sliding
+                  ? "SPACE OUT OF THE SLIDE!"
+                  : hud.punchCombo >= 2
+                    ? "KEEP THE PUNCH COMBO GOING!"
+                    : hud.speed > 2
+                      ? "LMB/Q WEB · X WEB-SHOT · RMB/E GLIDE · V PUNCH"
+                      : "RUN AT A WALL + JUMP TO CLIMB IT"}
         </div>
       </div>
 
       {/* mini controls */}
       <div className="absolute bottom-5 right-4 flex flex-col gap-1 text-[10px] text-web/70 font-semibold tracking-wider text-right">
         <div><span className="text-white/80">SHIFT</span> RUN · <span className="text-white/80">CTRL/C</span> SLIDE · <span className="text-white/80">F</span> DASH · <span className="text-white/80">V</span> PUNCH</div>
-        <div><span className="text-white/80">LMB/Q</span> SWING · <span className="text-white/80">RMB/E</span> GLIDE · <span className="text-white/80">R</span> RESET · <span className="text-white/80">P</span> PAUSE</div>
+        <div><span className="text-white/80">LMB/Q</span> SWING · <span className="text-white/80">X</span> WEB-SHOT · <span className="text-white/80">RMB/E</span> GLIDE · <span className="text-white/80">WALL</span> CLIMB</div>
       </div>
     </div>
   );
@@ -506,13 +508,15 @@ export function StartScreen({
         {/* footer strip */}
         <div className="anim-rise mt-9 flex flex-wrap items-center gap-x-8 gap-y-3" style={{ animationDelay: "0.4s" }}>
           <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 text-[10px] text-web/70 font-semibold tracking-wider">
-            <span><span className="key-cap">LMB</span> / <span className="key-cap">Q</span> WEB</span>
+            <span><span className="key-cap">LMB</span> / <span className="key-cap">Q</span> SWING</span>
+            <span><span className="key-cap">X</span> WEB-SHOT</span>
             <span><span className="key-cap">SPACE</span> JUMP</span>
             <span><span className="key-cap">CTRL</span> / <span className="key-cap">C</span> SLIDE</span>
             <span><span className="key-cap">SHIFT</span> RUN</span>
             <span><span className="key-cap">F</span> DASH</span>
             <span><span className="key-cap">RMB</span> / <span className="key-cap">E</span> GLIDE</span>
-            <span><span className="key-cap">P</span> PAUSE</span>
+            <span><span className="key-cap">V</span> PUNCH</span>
+            <span>RUN+JUMP AT A WALL TO <span className="text-punch">CLIMB</span></span>
           </div>
           {best > 0 && (
             <span className="ml-auto text-[11px] tracking-widest font-semibold text-white/60">

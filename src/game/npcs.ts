@@ -68,6 +68,8 @@ interface Thug {
   patrolT: THREE.Vector3;
   kb: THREE.Vector3;
   phase: number;
+  webT: number;
+  cocoon: THREE.Mesh;
 }
 
 interface Rock {
@@ -90,6 +92,14 @@ export class Crowd {
   private thugSpawns: THREE.Vector3[] = [];
   private geoRock = new THREE.SphereGeometry(0.34, 8, 8);
   private matRock = new THREE.MeshToonMaterial({ color: 0x8d93a8 });
+  private geoCocoon = new THREE.IcosahedronGeometry(1.25, 1);
+  private matCocoon = new THREE.MeshBasicMaterial({
+    color: 0xf2fbff,
+    transparent: true,
+    opacity: 0.42,
+    wireframe: false,
+    depthWrite: false,
+  });
   private disposed = false;
 
   constructor(scene: THREE.Scene, city: City) {
@@ -140,6 +150,10 @@ export class Crowd {
     for (let i = 0; i < THUG_COUNT; i++) {
       const rig = buildR6Rig(thugStyle());
       rig.group.scale.setScalar(1.06);
+      const cocoon = new THREE.Mesh(this.geoCocoon, this.matCocoon);
+      cocoon.position.y = 1.1;
+      cocoon.visible = false;
+      rig.group.add(cocoon);
       const t: Thug = {
         rig,
         spawn: this.thugSpawns[i],
@@ -156,6 +170,8 @@ export class Crowd {
         patrolT: this.thugSpawns[i].clone(),
         kb: new THREE.Vector3(),
         phase: rnd() * 6,
+        webT: 0,
+        cocoon,
       };
       rig.group.position.copy(t.spawn);
       scene.add(rig.group);
@@ -188,6 +204,8 @@ export class Crowd {
       t.attackCd = 1.5;
       t.rockCd = 3;
       t.kb.set(0, 0, 0);
+      t.webT = 0;
+      t.cocoon.visible = false;
       t.rig.group.position.copy(t.spawn);
       t.rig.group.visible = true;
       t.rig.group.scale.setScalar(1.06);
@@ -196,6 +214,31 @@ export class Crowd {
       r.active = false;
       r.mesh.visible = false;
     }
+  }
+
+  /** Stick the nearest thug to the point in a web cocoon. Returns true on hit. */
+  webAt(x: number, y: number, z: number): boolean {
+    let best: Thug | null = null;
+    let bestD = 2.9 * 2.9;
+    for (const t of this.thugs) {
+      if (t.dead || t.webT > 0) continue;
+      const tp = t.rig.group.position;
+      const dx = tp.x - x;
+      const dy = tp.y + 1.1 - y;
+      const dz = tp.z - z;
+      const d = dx * dx + dy * dy + dz * dz;
+      if (d < bestD) {
+        bestD = d;
+        best = t;
+      }
+    }
+    if (!best) return false;
+    best.webT = 5;
+    best.windup = 0;
+    best.lungeT = 0;
+    best.stagger = 0;
+    best.cocoon.visible = true;
+    return true;
   }
 
   private groundAt(x: number, z: number): number {
@@ -242,7 +285,8 @@ export class Crowd {
         const dot = (dx * p.dx + dy * p.dy + dz * p.dz) / d;
         if (dot < 0.25) continue;
         hitAny = true;
-        t.hp -= p.dmg;
+        // a webbed thug is helpless — one punch finishes it
+        t.hp -= t.webT > 0 ? 999 : p.dmg;
         t.flash = 1;
         t.stagger = 0.42;
         t.windup = 0;
@@ -251,6 +295,8 @@ export class Crowd {
         api.particles.burst(_v1.set(tp.x, tp.y + 1.2, tp.z), 12, ["#ffffff", "#ffcf3f", "#ff2438"], 7, 0.45, 2.4);
         if (t.hp <= 0) {
           t.dead = true;
+          t.webT = 0;
+          t.cocoon.visible = false;
           t.respawnT = 16;
           t.rig.group.visible = false;
           api.particles.burst(_v1.set(tp.x, tp.y + 1, tp.z), 34, ["#ff2438", "#ffcf3f", "#ffffff", "#2c3140"], 12, 1, 3);
@@ -323,6 +369,21 @@ export class Crowd {
       const dz = pp.z - gpos.z;
       const dh = Math.hypot(dx, dz);
       const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+      // webbed: trapped in the cocoon, struggling until it wears off
+      if (t.webT > 0) {
+        t.webT -= dt;
+        t.rig.group.rotation.z = Math.sin(api.elapsed * 26) * 0.07;
+        t.cocoon.rotation.y += dt * 2;
+        const pulse = 1 + Math.sin(api.elapsed * 12) * 0.04;
+        t.cocoon.scale.setScalar(pulse);
+        if (t.webT <= 0) {
+          t.cocoon.visible = false;
+          t.rig.group.rotation.z = 0;
+          t.cocoon.scale.setScalar(1);
+        }
+        continue;
+      }
 
       // knockback decay
       if (t.kb.lengthSq() > 0.01) {
