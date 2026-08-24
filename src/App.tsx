@@ -331,7 +331,11 @@ export default function App() {
           isNewBest={isNewBest}
           onRetry={restart}
           onMenu={toMenu}
-          onBoard={BACKEND_READY ? () => openBoard(stats.mode === "free" ? "free" : stats.mode) : undefined}
+          onBoard={
+            BACKEND_READY
+              ? () => openBoard(stats.mode === "circuit" ? "free" : stats.mode === "free" ? "free" : stats.mode)
+              : undefined
+          }
         />
       )}
 

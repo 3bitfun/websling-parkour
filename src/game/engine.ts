@@ -5,9 +5,19 @@ import { createRoomTransport, randomPid, type NetPacket, type NetStatus, type Ro
 import { BACKEND_READY, onAuthChange, submitScore, type AccountUser } from "./backend";
 import { buildR6Rig, spiderStyle, type Rig } from "./rig";
 import { Crowd, type PunchEvent } from "./npcs";
+import { CIRCUITS, GLOVES, SUITS, type Circuit } from "./catalog";
+import {
+  addCoins,
+  fetchCoins,
+  fetchInventory,
+  grantItem,
+  setTrialTime,
+  spendCoins,
+} from "./backend";
 
 export type Phase = "menu" | "playing" | "paused" | "won" | "lost";
-export type Mode = "solo" | "free" | "versus";
+/** "versus" is kept internally for the net/standings machinery; free play auto-links globally. */
+export type Mode = "solo" | "free" | "versus" | "circuit";
 
 export interface Standing {
   pid: string;
@@ -111,6 +121,13 @@ interface Token {
   phase: number;
   active: boolean;
   respawn: number;
+}
+
+interface CircuitRing {
+  mesh: THREE.Mesh;
+  glow: THREE.Sprite;
+  pos: THREE.Vector3;
+  hit: boolean;
 }
 
 /* ---------------- particles ---------------- */
@@ -259,6 +276,21 @@ export class Engine {
   private mouseWeb = false;
   private braking = false;
   private locked = false;
+
+  // ---- time-trial circuits ----
+  private circuitId: string | null = null;
+  private circuitRings: CircuitRing[] = [];
+  private circuitRingIdx = 0;
+  private circuitTime = 0;
+  private circuitLine: THREE.Line | null = null;
+  private circuitBeam: THREE.Mesh | null = null;
+
+  // ---- collection / inventory ----
+  wallet = 0;
+  owned = new Set<string>(["glove-starter", "suit-spider"]);
+  equippedGlove = "glove-starter";
+  equippedSuit = "suit-spider";
+  private webslingerFound = false;
 
   // touch input (mobile) — held states + joystick; edge actions come through methods
   touch = { joyX: 0, joyY: 0, web: false, glide: false, slide: false };
@@ -1247,6 +1279,243 @@ export class Engine {
       arr.setXYZ(0, hand.x, hand.y, hand.z);
       arr.setXYZ(1, s.p.x, s.p.y, s.p.z);
       arr.needsUpdate = true;
+    }
+  }
+
+  /* ---------------- time-trial circuits ---------------- */
+  startCircuit(id: string) {
+    const c = CIRCUITS.find((x) => x.id === id);
+    if (!c) return;
+    this.clearCircuit();
+    this.circuitId = id;
+    this.mode = "circuit";
+    // path line
+    const pts = c.pts.map(([x, y, z]) => new THREE.Vector3(x, y, z));
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+    this.circuitLine = new THREE.Line(
+      lineGeo,
+      new THREE.LineDashedMaterial({ color: c.color, dashSize: 2, gapSize: 1.4, transparent: true, opacity: 0.5 })
+    );
+    this.circuitLine.computeLineDistances();
+    this.scene.add(this.circuitLine);
+    // rings
+    for (let i = 0; i < pts.length; i++) {
+      const mesh = new THREE.Mesh(
+        new THREE.TorusGeometry(4, 0.3, 10, 30),
+        new THREE.MeshBasicMaterial({ color: c.color, transparent: true, opacity: 0.35 })
+      );
+      mesh.position.copy(pts[i]);
+      if (i + 1 < pts.length) mesh.lookAt(pts[i + 1]);
+      const glow = new THREE.Sprite(
+        new THREE.SpriteMaterial({ map: this.glowTex, color: c.color, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.5 })
+      );
+      glow.scale.setScalar(9);
+      glow.position.copy(pts[i]);
+      this.scene.add(mesh, glow);
+      this.circuitRings.push({ mesh, glow, pos: pts[i].clone(), hit: false });
+    }
+    // beam on the active ring
+    this.circuitBeam = new THREE.Mesh(
+      new THREE.CylinderGeometry(4.4, 4.4, 90, 16, 1, true),
+      new THREE.MeshBasicMaterial({ color: c.color, transparent: true, opacity: 0.1, side: THREE.DoubleSide, depthWrite: false })
+    );
+    this.scene.add(this.circuitBeam);
+    this.startRun("circuit");
+  }
+
+  private clearCircuit() {
+    for (const r of this.circuitRings) {
+      this.scene.remove(r.mesh, r.glow);
+      r.mesh.geometry.dispose();
+      (r.mesh.material as THREE.Material).dispose();
+      (r.glow.material as THREE.Material).dispose();
+    }
+    this.circuitRings = [];
+    if (this.circuitLine) {
+      this.scene.remove(this.circuitLine);
+      this.circuitLine.geometry.dispose();
+      (this.circuitLine.material as THREE.Material).dispose();
+      this.circuitLine = null;
+    }
+    if (this.circuitBeam) {
+      this.scene.remove(this.circuitBeam);
+      this.circuitBeam.geometry.dispose();
+      (this.circuitBeam.material as THREE.Material).dispose();
+      this.circuitBeam = null;
+    }
+    this.circuitId = null;
+    this.circuitRingIdx = 0;
+    this.circuitTime = 0;
+  }
+
+  private circuitActive(): boolean {
+    return this.mode === "circuit" && this.circuitId !== null && this.countdown <= 0;
+  }
+
+  private updateCircuit(dt: number) {
+    if (!this.circuitActive() || this.circuitRingIdx >= this.circuitRings.length) return;
+    this.circuitTime += dt;
+    const ring = this.circuitRings[this.circuitRingIdx];
+    // orient beam at current ring + pulse the active ring
+    if (this.circuitBeam) {
+      this.circuitBeam.position.set(ring.pos.x, ring.pos.y, ring.pos.z);
+      this.circuitBeam.rotation.y += dt * 1.4;
+    }
+    const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 6);
+    (ring.mesh.material as THREE.MeshBasicMaterial).opacity = 0.5 + pulse * 0.5;
+    ring.mesh.rotation.z += dt * 1.2;
+    // pass detection
+    if (this.pos.distanceTo(ring.pos) < 7) {
+      ring.hit = true;
+      (ring.mesh.material as THREE.MeshBasicMaterial).opacity = 0.15;
+      (ring.glow.material as THREE.SpriteMaterial).opacity = 0.12;
+      this.circuitRingIdx++;
+      this.sfx.token();
+      this.popupAt(ring.pos.clone().add(new THREE.Vector3(0, 5, 0)), `RING ${this.circuitRingIdx}/${this.circuitRings.length}`, "cyan");
+      this.particles.burst(ring.pos, 22, ["#ffffff", "#35e0ff"], 8, 0.6, 2.6);
+      if (this.circuitRingIdx >= this.circuitRings.length) this.finishCircuit();
+    }
+  }
+
+  private finishCircuit() {
+    const c = CIRCUITS.find((x) => x.id === this.circuitId);
+    if (!c) return;
+    const ms = Math.round(this.circuitTime * 1000);
+    const beatTarget = this.circuitTime <= c.target;
+    const prevBest = Number(localStorage.getItem(`websling-tt-${c.id}`) ?? 0);
+    const isPb = prevBest === 0 || ms < prevBest;
+    if (isPb) localStorage.setItem(`websling-tt-${c.id}`, String(ms));
+    // coins reward
+    const reward = beatTarget ? 60 : 25;
+    this.addWallet(reward);
+    // grant the reward item on first target-beat
+    if (beatTarget) this.unlockItem(c.reward, `${c.name} target beaten`);
+    // submit trial time
+    if (BACKEND_READY && this.authUser) {
+      setTrialTime(this.authUser.id, c.id, ms).catch(() => undefined);
+    }
+    this.sfx.win();
+    this.clearCircuit();
+    this.endRun(true);
+  }
+
+  /* ---------------- collection / inventory ---------------- */
+  addWallet(n: number) {
+    if (n <= 0) return;
+    this.wallet += n;
+    if (BACKEND_READY && this.authUser) addCoins(this.authUser.id, n).catch(() => undefined);
+    this.cbs.onWallet?.(this.wallet);
+  }
+
+  syncProfile(uid: string) {
+    if (!BACKEND_READY) return;
+    fetchCoins(uid).then((c) => {
+      this.wallet = c;
+      this.cbs.onWallet?.(c);
+    }).catch(() => undefined);
+    fetchInventory(uid).then((items) => {
+      for (const it of items) this.owned.add(it);
+      this.cbs.onInventory?.([...this.owned]);
+    }).catch(() => undefined);
+  }
+
+  unlockItem(id: string, reason: string) {
+    if (this.owned.has(id)) return;
+    this.owned.add(id);
+    if (BACKEND_READY && this.authUser) grantItem(this.authUser.id, id).catch(() => undefined);
+    this.cbs.onInventory?.([...this.owned]);
+    this.popupAt(this.pos.clone().add(new THREE.Vector3(0, 2.6, 0)), `UNLOCKED: ${this.itemName(id)}`, "gold");
+    this.sfx.unlock();
+    void reason;
+  }
+
+  private itemName(id: string): string {
+    return GLOVES.find((g) => g.id === id)?.name ?? SUITS.find((s) => s.id === id)?.name ?? id;
+  }
+
+  equipGlove(id: string) {
+    if (!this.owned.has(id)) return;
+    this.equippedGlove = id;
+    localStorage.setItem("websling-glove", id);
+    this.applyGlove();
+  }
+
+  equipSuit(id: string) {
+    if (!this.owned.has(id)) return;
+    this.equippedSuit = id;
+    localStorage.setItem("websling-suit", id);
+    this.rebuildPlayerRig();
+  }
+
+  /** Spend coins at the kiosk; returns the new wallet or null on failure. */
+  buyItem(id: string, price: number): number | null {
+    if (this.owned.has(id) || this.wallet < price) return null;
+    this.wallet -= price;
+    this.owned.add(id);
+    if (BACKEND_READY && this.authUser) {
+      spendCoins(this.authUser.id, price).catch(() => undefined);
+      grantItem(this.authUser.id, id).catch(() => undefined);
+    }
+    this.cbs.onWallet?.(this.wallet);
+    this.cbs.onInventory?.([...this.owned]);
+    this.sfx.unlock();
+    return this.wallet;
+  }
+
+  private applyGlove() {
+    const g = GLOVES.find((x) => x.id === this.equippedGlove) ?? GLOVES[0];
+    const col = new THREE.Color(g.tint);
+    (this.webLine.material as THREE.LineBasicMaterial).color.copy(col);
+    (this.webGlow.material as THREE.LineBasicMaterial).color.copy(col);
+    for (const s of this.webShots) (s.mesh.material as THREE.MeshBasicMaterial).color.copy(col);
+  }
+
+  private gloveSwingBonus(): number {
+    return GLOVES.find((x) => x.id === this.equippedGlove)?.swingBonus ?? 0;
+  }
+
+  private rebuildPlayerRig() {
+    const suit = SUITS.find((s) => s.id === this.equippedSuit) ?? SUITS[0];
+    const oldPos = this.player.position.clone();
+    const oldRot = this.player.rotation.y;
+    this.scene.remove(this.player);
+    this.disposeRig(this.rig);
+    this.rig = buildR6Rig({
+      head: suit.head,
+      torso: suit.torso,
+      arms: suit.arms,
+      legs: suit.legs,
+      eye: suit.eye,
+      headTex: suit.id === "suit-spider" ? spiderStyle().headTex : null,
+      torsoTex: suit.id === "suit-spider" ? spiderStyle().torsoTex : null,
+      armTex: suit.id === "suit-spider" ? spiderStyle().armTex : null,
+      spider: suit.id === "suit-spider",
+    });
+    this.player = this.rig.group;
+    this.player.position.copy(oldPos);
+    this.player.rotation.y = oldRot;
+    this.scene.add(this.player);
+  }
+
+  private disposeRig(rig: Rig) {
+    rig.group.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (mesh.isMesh) {
+        mesh.geometry.dispose();
+        const m = mesh.material;
+        if (Array.isArray(m)) m.forEach((x) => x.dispose());
+        else m.dispose();
+      }
+    });
+  }
+
+  /** Proximity unlock: the Web-Slinger on the Unisphere. */
+  private checkWebslinger() {
+    if (this.webslingerFound || this.owned.has("suit-webslinger")) return;
+    if (this.pos.distanceTo(this.city.webslingerPos) < 12) {
+      this.webslingerFound = true;
+      this.unlockItem("suit-webslinger", "found the Web-Slinger");
+      this.particles.burst(this.city.webslingerPos, 40, ["#ffcf3f", "#ffffff"], 10, 1.2, 3);
     }
   }
 

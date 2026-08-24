@@ -160,14 +160,14 @@ export class Crowd {
       const axisX = rnd() < 0.5;
       const line = STREET_LINES[Math.floor(rnd() * STREET_LINES.length)];
       const side = rnd() < 0.5 ? -1 : 1;
-      const along = (rnd() * 2 - 1) * 240;
+      const along = (rnd() * 2 - 1) * 330;
       const civ: Civ = {
         rig,
         axisX,
         line,
         side,
         along,
-        target: (rnd() * 2 - 1) * 240,
+        target: (rnd() * 2 - 1) * 330,
         speed: 1.1 + rnd() * 1.5,
         pause: rnd() * 3,
         phase: rnd() * 6,
@@ -475,7 +475,7 @@ export class Crowd {
     /* ---- civilians ---- */
     for (const c of this.civs) {
       const gpos = c.rig.group.position;
-      const far = Math.abs(gpos.x - pp.x) + Math.abs(gpos.z - pp.z) > 190;
+      const far = Math.abs(gpos.x - pp.x) + Math.abs(gpos.z - pp.z) > 260;
       if (far) continue;
       if (c.pause > 0) {
         c.pause -= dt;

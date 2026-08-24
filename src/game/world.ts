@@ -22,13 +22,16 @@ export interface AnchorHit {
   sky: boolean;
 }
 
-const GRID = 9; // 9x9 blocks
+const GRID = 12; // 12x12 blocks — a much bigger Queens
 const SPACING = 64;
 const PAD = 44; // building pad width inside a block
-export const WORLD_SPAN = ((GRID - 1) / 2) * SPACING; // 256
+export const WORLD_SPAN = ((GRID - 1) / 2) * SPACING; // 352
 export const MAX_ROOF = 66;
-export const STREET_LINES = [-224, -160, -96, -32, 32, 96, 160, 224];
+/** Interior street lines (block boundaries). Blocks sit at ±32, ±96, ... */
+export const STREET_LINES: number[] = [];
+for (let k = -GRID / 2 + 1; k < GRID / 2; k++) STREET_LINES.push(k * SPACING);
 export const SIDEWALK = 8.5;
+const HALF_SPAN = (GRID * SPACING) / 2; // 384 — outer block edge
 
 function mulberry(seed: number) {
   let a = seed >>> 0;
@@ -101,9 +104,10 @@ function groundTexture() {
     }
   });
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
-  t.repeat.set(1600 / SPACING, 1600 / SPACING);
+  t.repeat.set(GROUND_SIZE / SPACING, GROUND_SIZE / SPACING);
   return t;
 }
+const GROUND_SIZE = 1280; // 20 blocks, covers the 12x12 Queens grid with margin
 
 function signTexture() {
   return canvasTex(128, (c, s) => {
@@ -133,7 +137,10 @@ export class City {
   healSpots: THREE.Vector3[] = [];
   eggs: EggSpot[] = [];
   ufo: THREE.Group | null = null;
-  spawn = new THREE.Vector3(32, 0, 14);
+  /** The Web-Slinger NPC stands atop the Unisphere. */
+  webslingerPos = new THREE.Vector3(272, 46, 272);
+  /** Spider-Base rooftop spawn. */
+  spawn = new THREE.Vector3(-32, 14.6, -32);
   beaconMat: THREE.MeshBasicMaterial;
 
   constructor() {
@@ -150,6 +157,9 @@ export class City {
       for (let j = 0; j < GRID; j++) {
         const cx = (i - half) * SPACING;
         const cz = (j - half) * SPACING;
+        // reserve the park corner (Unisphere) and the Spider-Base block
+        if (cx >= 224 && cz >= 224) continue;
+        if (cx === -32 && cz === -32) continue;
         const centerDist = Math.max(Math.abs(cx), Math.abs(cz));
         const tall = centerDist < 100 ? 26 : centerDist < 180 ? 10 : -8;
         if (rnd() < 0.3) {
@@ -364,14 +374,14 @@ export class City {
 
     // ---- ground / sky / stars / moon ----
     const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(1600, 1600),
+      new THREE.PlaneGeometry(GROUND_SIZE, GROUND_SIZE),
       new THREE.MeshLambertMaterial({ map: groundTexture() })
     );
     ground.rotation.x = -Math.PI / 2;
     this.group.add(ground);
 
     const sky = new THREE.Mesh(
-      new THREE.SphereGeometry(900, 24, 16),
+      new THREE.SphereGeometry(1500, 24, 16),
       new THREE.ShaderMaterial({
         side: THREE.BackSide,
         depthWrite: false,
@@ -404,7 +414,7 @@ export class City {
     for (let i = 0; i < 550; i++) {
       const th = rnd() * Math.PI * 2;
       const ph = rnd() * Math.PI * 0.46;
-      const r = 840;
+      const r = 1380;
       starPos[i * 3] = r * Math.sin(ph) * Math.cos(th);
       starPos[i * 3 + 1] = r * Math.cos(ph) + 30;
       starPos[i * 3 + 2] = r * Math.sin(ph) * Math.sin(th);
@@ -445,9 +455,9 @@ export class City {
 
     // ---- coin spots: street-level trails + rooftop stashes ----
     const crnd = mulberry(9001);
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < 80; i++) {
       const street = STREET_LINES[Math.floor(crnd() * STREET_LINES.length)];
-      const along = (crnd() * 2 - 1) * 240;
+      const along = (crnd() * 2 - 1) * 330;
       const j = (crnd() - 0.5) * 7;
       this.coinSpots.push(
         crnd() < 0.5 ? new THREE.Vector3(street + j, 1.6, along) : new THREE.Vector3(along, 1.6, street + j)
@@ -588,13 +598,200 @@ export class City {
       const legR = legL.clone();
       legR.position.x = 1;
       tung.add(pedestal, torsoT, headT, tw1, tw2, tp1, tp2, mouth, armL, armR, bat, legL, legR);
-      tung.position.set(246, 0, 246);
-      tung.rotation.y = -2.3;
+      tung.position.set(-330, 0, -330);
+      tung.rotation.y = 0.8;
       this.group.add(tung);
       const label = makeTextSprite("TUNG TUNG TUNG SAHUR");
-      label.position.set(246, 21, 246);
+      label.position.set(-330, 21, -330);
       this.group.add(label);
-      this.eggs.push({ id: "tung", pos: new THREE.Vector3(246, 8, 246), r: 18, label: "TUNG TUNG TUNG SAHUR" });
+      this.eggs.push({ id: "tung", pos: new THREE.Vector3(-330, 8, -330), r: 18, label: "TUNG TUNG TUNG SAHUR" });
+    }
+
+    this.buildSpiderBase();
+    this.buildParkAndUnisphere();
+    this.buildQueensboroBridge();
+    this.buildStreetSigns();
+  }
+
+  /** The player's home — a rooftop helipad base in midtown Queens. */
+  private buildSpiderBase() {
+    const g = new THREE.Group();
+    // main tower block (also registered as collision)
+    const bx = -32,
+      bz = -32,
+      top = 14;
+    this.boxes.push({ cx: bx, cz: bz, hx: 15, hz: 15, top });
+    const base = new THREE.Mesh(
+      new THREE.BoxGeometry(30, top, 30),
+      new THREE.MeshLambertMaterial({ color: 0x232b52 })
+    );
+    base.position.set(bx, top / 2, bz);
+    g.add(base);
+    // helipad disc + "S" marking
+    const pad = new THREE.Mesh(
+      new THREE.CylinderGeometry(9, 9, 0.4, 26),
+      new THREE.MeshLambertMaterial({ color: 0x2b3350 })
+    );
+    pad.position.set(bx, top + 0.2, bz);
+    g.add(pad);
+    const padRing = new THREE.Mesh(
+      new THREE.TorusGeometry(7.4, 0.28, 8, 40),
+      new THREE.MeshBasicMaterial({ color: 0xffcf3f })
+    );
+    padRing.rotation.x = -Math.PI / 2;
+    padRing.position.set(bx, top + 0.45, bz);
+    g.add(padRing);
+    const sMark = makeTextSprite("S");
+    sMark.scale.set(6, 6, 1);
+    sMark.position.set(bx, top + 3.4, bz);
+    g.add(sMark);
+    // corner antennas with red beacons
+    const antM = new THREE.MeshLambertMaterial({ color: 0x1c2340 });
+    for (const [ox, oz] of [[-12, -12], [12, 12], [-12, 12], [12, -12]]) {
+      const ant = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.4, 7, 8), antM);
+      ant.position.set(bx + ox, top + 3.5, bz + oz);
+      g.add(ant);
+      const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.5, 8, 8), this.beaconMat);
+      beacon.position.set(bx + ox, top + 7.2, bz + oz);
+      g.add(beacon);
+    }
+    // glowing sign
+    const sign = makeTextSprite("SPIDER-BASE");
+    sign.position.set(bx, top + 11.5, bz);
+    g.add(sign);
+    this.group.add(g);
+    // respawn point on the pad
+    this.spawn.set(bx, top + 0.6, bz);
+  }
+
+  /** Flushing Meadows corner: green park, the Unisphere, and the Web-Slinger. */
+  private buildParkAndUnisphere() {
+    const g = new THREE.Group();
+    const park = new THREE.Mesh(
+      new THREE.PlaneGeometry(190, 190),
+      new THREE.MeshLambertMaterial({ color: 0x14351f })
+    );
+    park.rotation.x = -Math.PI / 2;
+    park.position.set(288, 0.12, 288);
+    g.add(park);
+    // trees
+    const trunkM = new THREE.MeshLambertMaterial({ color: 0x4a3b2b });
+    const leafM = new THREE.MeshLambertMaterial({ color: 0x1e5a33, emissive: 0x06140b });
+    const trnd = mulberry(777);
+    for (let i = 0; i < 22; i++) {
+      const tx = 210 + trnd() * 156;
+      const tz = 210 + trnd() * 156;
+      if (Math.hypot(tx - 288, tz - 288) < 26) continue;
+      const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.7, 4, 7), trunkM);
+      trunk.position.set(tx, 2, tz);
+      const leaf = new THREE.Mesh(new THREE.ConeGeometry(3.4, 8, 8), leafM);
+      leaf.position.set(tx, 8, tz);
+      g.add(trunk, leaf);
+    }
+    // the Unisphere: giant steel globe on a pedestal
+    const ped = new THREE.Mesh(
+      new THREE.CylinderGeometry(6, 9, 12, 16),
+      new THREE.MeshLambertMaterial({ color: 0x8d93a8, emissive: 0x0d1018 })
+    );
+    ped.position.set(288, 6, 288);
+    g.add(ped);
+    const globe = new THREE.Mesh(
+      new THREE.SphereGeometry(15, 28, 20),
+      new THREE.MeshBasicMaterial({ color: 0x3d4a6b, wireframe: true, transparent: true, opacity: 0.9 })
+    );
+    globe.position.set(288, 30, 288);
+    g.add(globe);
+    const inner = new THREE.Mesh(
+      new THREE.SphereGeometry(14, 24, 18),
+      new THREE.MeshBasicMaterial({ color: 0x1a2440, transparent: true, opacity: 0.55 })
+    );
+    inner.position.copy(globe.position);
+    g.add(inner);
+    // the Web-Slinger perched on top, marked by a gold beacon beam
+    const beam = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.2, 2.6, 60, 12, 1, true),
+      new THREE.MeshBasicMaterial({ color: 0xffcf3f, transparent: true, opacity: 0.14, side: THREE.DoubleSide, depthWrite: false })
+    );
+    beam.position.set(288, 75, 288);
+    g.add(beam);
+    this.webslingerPos.set(288, 46.5, 288);
+    this.group.add(g);
+    this.eggs.push({ id: "unisphere", pos: new THREE.Vector3(288, 30, 288), r: 26, label: "THE UNSPHERE" });
+  }
+
+  /** A bridge crossing the map along the z=0 street, linking west and east Queens. */
+  private buildQueensboroBridge() {
+    const g = new THREE.Group();
+    const deckM = new THREE.MeshLambertMaterial({ color: 0x2b3350 });
+    const cableM = new THREE.MeshBasicMaterial({ color: 0x35e0ff, transparent: true, opacity: 0.5 });
+    const y0 = 15;
+    // deck segments spanning x = -320..320 along z=0
+    for (let x = -320; x <= 320; x += 64) {
+      this.boxes.push({ cx: x, cz: 0, hx: 32, hz: 9, top: y0 + 1.6, y0 });
+      const seg = new THREE.Mesh(new THREE.BoxGeometry(64, 1.6, 18), deckM);
+      seg.position.set(x, y0 + 0.8, 0);
+      g.add(seg);
+      // glowing edge rails
+      const rail = new THREE.Mesh(new THREE.BoxGeometry(64, 0.3, 0.4), cableM);
+      rail.position.set(x, y0 + 1.8, 8.6);
+      const rail2 = rail.clone();
+      rail2.position.z = -8.6;
+      g.add(rail, rail2);
+    }
+    // two suspension towers with cables
+    const towerM = new THREE.MeshLambertMaterial({ color: 0x3a3f55, emissive: 0x0d1020 });
+    for (const tx of [-160, 160]) {
+      const tower = new THREE.Mesh(new THREE.BoxGeometry(6, 46, 6), towerM);
+      tower.position.set(tx, 23, 0);
+      g.add(tower);
+      const lamp = new THREE.Mesh(new THREE.SphereGeometry(1, 8, 8), new THREE.MeshBasicMaterial({ color: 0xff2438 }));
+      lamp.position.set(tx, 47, 0);
+      g.add(lamp);
+      // cables fanning from tower top to the deck
+      for (let k = -3; k <= 3; k++) {
+        if (k === 0) continue;
+        const cable = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 1, 6), cableM);
+        const sx = tx,
+          sy = 44,
+          ex = tx + k * 26,
+          ey = y0 + 2;
+        const mid = new THREE.Vector3((sx + ex) / 2, (sy + ey) / 2, 0);
+        const len = Math.hypot(ex - sx, ey - sy);
+        cable.scale.y = len;
+        cable.position.copy(mid);
+        cable.rotation.z = Math.atan2(ex - sx, sy - ey) * -1;
+        cable.rotation.z = Math.atan2(-(ex - sx), sy - ey);
+        g.add(cable);
+      }
+    }
+    const sign = makeTextSprite("QUEENSBORO BRIDGE");
+    sign.position.set(0, y0 + 9, 0);
+    g.add(sign);
+    this.group.add(g);
+  }
+
+  /** Street-name signs floating at intersections, Queens style. */
+  private buildStreetSigns() {
+    const names = [
+      "STEINWAY ST",
+      "BROADWAY",
+      "31ST ST",
+      "JAMAICA AVE",
+      "NORTHERN BLVD",
+      "ROOSEVELT AVE",
+      "GRAND AVE",
+      "ASTORIA BLVD",
+      "DITMARS BLVD",
+      "QUEENS BLVD",
+    ];
+    const srnd = mulberry(5150);
+    for (let i = 0; i < 26; i++) {
+      const x = STREET_LINES[Math.floor(srnd() * STREET_LINES.length)];
+      const z = STREET_LINES[Math.floor(srnd() * STREET_LINES.length)];
+      const sign = makeTextSprite(names[Math.floor(srnd() * names.length)]);
+      sign.scale.set(16, 2.5, 1);
+      sign.position.set(x + (srnd() - 0.5) * 10, 11 + srnd() * 3, z + (srnd() - 0.5) * 10);
+      this.group.add(sign);
     }
   }
 

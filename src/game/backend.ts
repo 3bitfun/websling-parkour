@@ -21,7 +21,7 @@ export interface BoardRow {
 }
 
 export interface ScoreEntry {
-  mode: "solo" | "free" | "versus";
+  mode: "solo" | "free" | "versus" | "circuit";
   score: number;
   tokens: number;
   maxCombo: number;
@@ -152,7 +152,7 @@ export async function submitScore(uid: string, entry: ScoreEntry): Promise<void>
   if (error) throw new Error(friendly(error.message));
 }
 
-export async function fetchLeaderboard(mode: "solo" | "free" | "versus" | "all"): Promise<BoardRow[]> {
+export async function fetchLeaderboard(mode: "solo" | "free" | "versus" | "circuit" | "all"): Promise<BoardRow[]> {
   const { data, error } = await client().rpc("websling_leaderboard", {
     p_mode: mode === "all" ? null : mode,
     p_limit: 100,
@@ -173,6 +173,69 @@ export async function fetchLeaderboard(mode: "solo" | "free" | "versus" | "all")
 
 /* ---------------- coins (persistent wallet) ---------------- */
 
+/* ---------------- inventory ---------------- */
+
+export async function fetchInventory(uid: string): Promise<string[]> {
+  const { data } = await client().from("websling_inventory").select("item_id").eq("user_id", uid);
+  return ((data as Array<{ item_id: string }> | null) ?? []).map((r) => r.item_id);
+}
+
+export async function grantItem(uid: string, itemId: string): Promise<void> {
+  const { error } = await client().rpc("websling_grant_item", { p_item: itemId });
+  if (error) throw new Error(friendly(error.message));
+}
+
+/* ---------------- time trials ---------------- */
+
+export interface TrialRow {
+  userId: string;
+  name: string;
+  trialId: string;
+  timeMs: number;
+}
+
+/** Global best per trial, joined with callsigns. */
+export async function fetchTrialsGlobal(): Promise<TrialRow[]> {
+  const { data, error } = await client().from("websling_trials").select("user_id, trial_id, time_ms");
+  if (error) throw new Error(friendly(error.message));
+  const rows = (data as Array<{ user_id: string; trial_id: string; time_ms: number }>) ?? [];
+  // best per (trial) globally
+  const bestByTrial = new Map<string, { user_id: string; time_ms: number }>();
+  for (const r of rows) {
+    const cur = bestByTrial.get(r.trial_id);
+    if (!cur || r.time_ms < cur.time_ms) bestByTrial.set(r.trial_id, r);
+  }
+  // best per pilot per trial (for "your best")
+  const out: TrialRow[] = [];
+  const nameCache = new Map<string, string>();
+  for (const [trialId, r] of bestByTrial) {
+    let name = nameCache.get(r.user_id);
+    if (name === undefined) {
+      name = (await fetchDisplayName(r.user_id)) ?? "SPIDER";
+      nameCache.set(r.user_id, name);
+    }
+    out.push({ userId: r.user_id, name, trialId, timeMs: r.time_ms });
+  }
+  return out;
+}
+
+/** Submit a trial time (server keeps the best). Returns the pilot's best in ms. */
+export async function setTrialTime(uid: string, trialId: string, ms: number): Promise<number> {
+  const { data, error } = await client().rpc("websling_set_trial", { p_trial: trialId, p_ms: ms });
+  if (error) throw new Error(friendly(error.message));
+  return Number(data ?? ms);
+}
+
+/* ---------------- coin spending ---------------- */
+
+export async function spendCoins(uid: string, amount: number): Promise<number> {
+  const { data, error } = await client().rpc("websling_spend_coins", { p_amount: amount });
+  if (error) throw new Error(friendly(error.message));
+  const bal = Number(data ?? -1);
+  if (bal < 0) throw new Error("Not enough coins in your web-wallet.");
+  return bal;
+}
+
 export async function fetchCoins(uid: string): Promise<number> {
   const { data } = await client().from("websling_profiles").select("coins").eq("user_id", uid).maybeSingle();
   return Number((data as { coins?: number } | null)?.coins ?? 0);
@@ -185,7 +248,7 @@ export async function addCoins(uid: string, amount: number): Promise<number> {
   return Number(data ?? 0);
 }
 
-export async function fetchMyBest(mode: "solo" | "free" | "versus" | "all", uid: string): Promise<number | null> {
+export async function fetchMyBest(mode: "solo" | "free" | "versus" | "circuit" | "all", uid: string): Promise<number | null> {
   let q = client().from("websling_scores").select("score").eq("user_id", uid);
   if (mode !== "all") q = q.eq("mode", mode);
   const { data } = await q.order("score", { ascending: false }).limit(1).maybeSingle();
