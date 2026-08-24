@@ -16,6 +16,8 @@ export interface RigStyle {
   torso: number;
   arms: number;
   legs: number;
+  /** lens color for the spider eyes; defaults to white */
+  eye?: number;
   /** Wrap texture applied to every head face (e.g. spider webbing). */
   headTex?: THREE.Texture | null;
   /** Transparent face overlay applied to the FRONT head face only (civ/thug). */
@@ -263,8 +265,9 @@ export function buildR6Rig(style: RigStyle): Rig {
   }
   head.position.y = 4.6 * S; // studs 4..5.2
 
-  // Spider: 3D white eye lenses on the front of the mask.
+  // Spider: 3D eye lenses on the front of the mask.
   if (style.spider) {
+    const eyeMat = new THREE.MeshBasicMaterial({ color: style.eye ?? 0xf6fcff });
     const eyeGeo = new THREE.BoxGeometry(0.34 * S, 0.62 * S, 0.06 * S);
     const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
     eyeL.position.set(-0.3 * S, 4.66 * S, 0.62 * S);

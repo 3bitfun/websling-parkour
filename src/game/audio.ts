@@ -144,6 +144,27 @@ export class Sfx {
     this.tone(930, 0.14, "sine", 0.16, undefined, 0.07);
   }
 
+  unlock() {
+    this.tone(523, 0.12, "triangle", 0.2);
+    this.tone(659, 0.12, "triangle", 0.2, undefined, 0.09);
+    this.tone(784, 0.2, "triangle", 0.22, undefined, 0.18);
+    this.tone(1046, 0.3, "sine", 0.18, undefined, 0.27);
+  }
+  dodge() {
+    this.noise(0.13, 2400, 0.2, 2.5, 5200);
+  }
+  counter() {
+    this.tone(880, 0.08, "square", 0.14);
+    this.tone(1320, 0.16, "square", 0.14, undefined, 0.06);
+    this.noise(0.1, 3000, 0.16, 2, 6000);
+  }
+  mission() {
+    this.tone(392, 0.16, "triangle", 0.2);
+    this.tone(494, 0.16, "triangle", 0.2, undefined, 0.14);
+    this.tone(587, 0.16, "triangle", 0.2, undefined, 0.28);
+    this.tone(784, 0.4, "triangle", 0.24, undefined, 0.42);
+  }
+
   /* ---------- pickups / style ---------- */
   coin() {
     this.tone(1320, 0.07, "square", 0.16);

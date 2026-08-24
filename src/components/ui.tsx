@@ -1,8 +1,10 @@
 import { useState, type CSSProperties, type FormEvent } from "react";
-import type { HudData, Mode, PopupData, RunStats, Standing } from "../game/engine";
+import type { HudData, MissionHud, Mode, PopupData, RunStats, Standing } from "../game/engine";
 import type { NetStatus } from "../game/net";
 import { SUPABASE_CONFIGURED } from "../game/net";
 import type { AccountUser, BoardRow } from "../game/backend";
+import { MISSIONS, type Mission } from "../game/story";
+import { GLOVES, SUITS, RARITY } from "../game/catalog";
 
 /* ---------- decorative corner web (pure SVG) ---------- */
 export function CornerWeb({ className = "" }: { className?: string }) {
@@ -143,6 +145,42 @@ export function Hud({ hud }: { hud: HudData }) {
             style={{ textShadow: "8px 8px 0 rgba(255,36,56,0.85), 0 0 60px rgba(255,207,63,0.4)" }}
           >
             {Math.ceil(hud.countdown)}
+          </div>
+        </div>
+      )}
+
+      {/* mission tracker */}
+      {hud.mission && (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 w-[min(340px,62vw)]">
+          <div className="panel panel-red px-4 py-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[9px] font-bold tracking-[0.3em] text-gold">{hud.mission.chapter}</span>
+              <span className="font-display text-base leading-none text-white text-outline-thin">{hud.mission.title}</span>
+            </div>
+            <div className="mt-1.5 flex flex-col gap-1">
+              {hud.mission.objectives.map((o, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <div
+                    className={`w-3.5 h-3.5 shrink-0 flex items-center justify-center border ${
+                      o.done ? "bg-mint border-mint" : "border-web/40"
+                    }`}
+                    style={{ clipPath: "polygon(50% 0,100% 50%,50% 100%,0 50%)" }}
+                  >
+                    {o.done && (
+                      <svg viewBox="0 0 12 12" className="w-2.5 h-2.5 text-ink" fill="none" stroke="currentColor" strokeWidth="2.4">
+                        <path d="M2 6l3 3 5-6" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    )}
+                  </div>
+                  <span className={`text-[11px] font-semibold tracking-wide flex-1 ${o.done ? "text-mint line-through" : "text-white/85"}`}>
+                    {o.text}
+                  </span>
+                  <span className={`text-[11px] font-bold tabular-nums ${o.done ? "text-mint" : "text-gold"}`}>
+                    {o.cur}/{o.target}
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}
@@ -1041,6 +1079,110 @@ export function LeaderboardScreen({
             BEST SCORE PER PILOT · TOP 100 · STORED IN WEBSLING_SCORES
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- mission briefing (story) ---------- */
+export function MissionBriefing({ mission, onStart }: { mission: Mission; onStart: () => void }) {
+  const rewardItem = mission.rewardItem
+    ? GLOVES.find((g) => g.id === mission.rewardItem) ?? SUITS.find((s) => s.id === mission.rewardItem)
+    : null;
+  return (
+    <div className="absolute inset-0 flex items-center justify-center font-body" style={{ background: "radial-gradient(ellipse at 50% 30%, rgba(20,24,66,0.85), rgba(4,6,20,0.95))" }}>
+      <CornerWeb className="absolute -top-2 -left-2 w-[420px] h-[420px] opacity-40 -rotate-90" />
+      <div className="relative max-w-2xl w-full mx-6">
+        <div className="anim-rise panel panel-red px-8 py-7">
+          <div className="flex items-baseline gap-3">
+            <span className="font-display text-xl tracking-[0.25em] text-gold">{mission.chapter}</span>
+            <div className="h-px flex-1 bg-gold/40" />
+          </div>
+          <h2 className="mt-1 font-display text-6xl leading-none text-white text-outline" style={{ textShadow: "5px 5px 0 rgba(255,36,56,0.85)" }}>
+            {mission.title}
+          </h2>
+          <div className="mt-4 flex flex-col gap-3">
+            {mission.brief.map((line, i) => (
+              <p key={i} className="text-white/85 text-sm md:text-base font-medium leading-relaxed">
+                {line}
+              </p>
+            ))}
+          </div>
+
+          <div className="mt-5 border-t border-web/15 pt-4">
+            <div className="text-[10px] font-bold tracking-[0.3em] text-web/80 mb-2">OBJECTIVES</div>
+            <div className="flex flex-col gap-1.5">
+              {mission.objectives.map((o) => (
+                <div key={o.id} className="flex items-center gap-2.5">
+                  <div className="w-2.5 h-2.5 rotate-45 border-2 border-gold shrink-0" />
+                  <span className="text-sm font-semibold text-white/90">{o.text}</span>
+                  <span className="ml-auto text-sm font-bold text-gold tabular-nums">×{o.target}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-4 flex items-center gap-3">
+            <div className="text-[10px] font-bold tracking-[0.3em] text-web/80">REWARD</div>
+            <span className="font-display text-lg text-gold">+{mission.rewardCoins} COINS</span>
+            {rewardItem && (
+              <span className="font-display text-lg" style={{ color: RARITY[rewardItem.rarity].color }}>
+                · {rewardItem.name}
+              </span>
+            )}
+          </div>
+
+          <button onClick={onStart} className="btn-comic mt-6 w-full py-3.5 text-2xl bg-spidey text-white text-outline-thin">
+            <span>SWING OUT</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- mission complete ---------- */
+export function MissionComplete({
+  mission,
+  nextMission,
+  onContinue,
+}: {
+  mission: Mission;
+  nextMission: Mission | null;
+  onContinue: () => void;
+}) {
+  const rewardItem = mission.rewardItem
+    ? GLOVES.find((g) => g.id === mission.rewardItem) ?? SUITS.find((s) => s.id === mission.rewardItem)
+    : null;
+  return (
+    <div className="absolute inset-0 flex items-center justify-center font-body" style={{ background: "radial-gradient(ellipse at center, rgba(13,20,51,0.85), rgba(4,6,20,0.94))" }}>
+      <div className="relative text-center px-6 max-w-xl">
+        <div className="anim-pop font-display text-[min(10vw,80px)] leading-none text-gold text-outline" style={{ textShadow: "6px 6px 0 rgba(255,36,56,0.85)" }}>
+          CHAPTER CLEAR
+        </div>
+        <div className="mt-2 font-display text-2xl tracking-[0.2em] text-white/90 text-outline-thin">{mission.title}</div>
+
+        <div className="anim-rise mt-6 mx-auto max-w-sm panel px-7 py-4 text-left" style={{ animationDelay: "0.15s" }}>
+          <div className="flex items-center justify-between py-1.5">
+            <span className="text-[11px] font-bold tracking-[0.28em] text-web/75">COINS EARNED</span>
+            <span className="font-display text-2xl text-gold">+{mission.rewardCoins}</span>
+          </div>
+          {rewardItem && (
+            <div className="flex items-center justify-between py-1.5 border-t border-web/15">
+              <span className="text-[11px] font-bold tracking-[0.28em] text-web/75">UNLOCKED</span>
+              <span className="font-display text-xl" style={{ color: RARITY[rewardItem.rarity].color }}>
+                {rewardItem.name}
+              </span>
+            </div>
+          )}
+          {mission.rewardNote && (
+            <p className="mt-2 pt-2 border-t border-web/15 text-sm text-white/75 font-medium italic">{mission.rewardNote}</p>
+          )}
+        </div>
+
+        <button onClick={onContinue} className="btn-comic anim-rise mt-7 px-12 py-3 text-2xl bg-mint text-ink" style={{ animationDelay: "0.25s" }}>
+          <span>{nextMission ? `NEXT: ${nextMission.title}` : "BACK TO THE SKYLINE"}</span>
+        </button>
       </div>
     </div>
   );

@@ -28,12 +28,15 @@ import {
   Hud,
   LeaderboardScreen,
   LobbyScreen,
+  MissionBriefing,
+  MissionComplete,
   PauseScreen,
   Popups,
   StartScreen,
   Toast,
 } from "./components/ui";
 import { MobileControls } from "./components/MobileControls";
+import { MISSIONS, type Mission } from "./game/story";
 
 const BEST_KEY = "webrunner-best-score";
 const NAME_KEY = "webrunner-name";
@@ -59,6 +62,7 @@ const initialHud: HudData = {
   dashReady: true,
   hp: 100,
   punchCombo: 0,
+  mission: null,
 };
 
 type BoardMode = "solo" | "free" | "versus" | "all";
@@ -115,6 +119,11 @@ export default function App() {
   const [refreshTick, setRefreshTick] = useState(0);
   const [toast, setToast] = useState<{ id: number; msg: string } | null>(null);
 
+  // story / mission state
+  const [briefing, setBriefing] = useState<Mission | null>(null);
+  const [completed, setCompleted] = useState<{ mission: Mission; next: Mission | null } | null>(null);
+  const briefedRef = useRef<Set<number>>(new Set());
+
   useEffect(() => {
     if (!canvasRef.current) return;
     const engine = new Engine(canvasRef.current, {
@@ -155,6 +164,9 @@ export default function App() {
       onRoster: setRoster,
       onNetStatus: setNetStatus,
       onToast: (msg) => setToast({ id: Date.now(), msg }),
+      onMissionComplete: (idx) => {
+        setCompleted({ mission: MISSIONS[idx], next: MISSIONS[idx + 1] ?? null });
+      },
     });
     engineRef.current = engine;
     return () => {
@@ -208,6 +220,17 @@ export default function App() {
       live = false;
     };
   }, [boardOpen, boardMode, account, refreshTick]);
+
+  // story: show the chapter briefing whenever we're in the menu with an un-briefed mission
+  useEffect(() => {
+    if (phase !== "menu" || briefing || completed) return;
+    const eng = engineRef.current;
+    if (!eng) return;
+    const m = eng.currentMission();
+    if (m && !briefedRef.current.has(eng.missionIndex())) {
+      setBriefing(m);
+    }
+  }, [phase, briefing, completed]);
 
   const blurActive = () => (document.activeElement as HTMLElement | null)?.blur?.();
 
@@ -358,6 +381,28 @@ export default function App() {
           account={account}
           onRefresh={() => setRefreshTick((t) => t + 1)}
           onClose={() => setBoardOpen(false)}
+        />
+      )}
+
+      {briefing && (
+        <MissionBriefing
+          mission={briefing}
+          onStart={() => {
+            briefedRef.current.add(engineRef.current?.missionIndex() ?? 0);
+            setBriefing(null);
+            engineRef.current?.startRun("free");
+          }}
+        />
+      )}
+      {completed && (
+        <MissionComplete
+          mission={completed.mission}
+          nextMission={completed.next}
+          onContinue={() => {
+            setCompleted(null);
+            const next = engineRef.current?.currentMission();
+            if (next) setBriefing(next);
+          }}
         />
       )}
 

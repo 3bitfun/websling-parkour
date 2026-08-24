@@ -5,6 +5,7 @@ import { createRoomTransport, randomPid, type NetPacket, type NetStatus, type Ro
 import { BACKEND_READY, onAuthChange, submitScore, type AccountUser } from "./backend";
 import { buildR6Rig, spiderStyle, type Rig } from "./rig";
 import { Crowd, type PunchEvent } from "./npcs";
+import { loadProgress, MISSIONS, saveProgress, type Mission, type ObjectiveDef } from "./story";
 import { CIRCUITS, GLOVES, SUITS, type Circuit } from "./catalog";
 import {
   addCoins,
@@ -56,6 +57,13 @@ export interface HudData {
   dashReady: boolean;
   hp: number;
   punchCombo: number;
+  mission: MissionHud | null;
+}
+
+export interface MissionHud {
+  chapter: string;
+  title: string;
+  objectives: { text: string; cur: number; target: number; done: boolean }[];
 }
 
 export interface PopupData {
@@ -86,6 +94,9 @@ export interface EngineCallbacks {
   onRoster: (list: Standing[]) => void;
   onNetStatus: (s: NetStatus) => void;
   onToast?: (msg: string) => void;
+  onWallet?: (coins: number) => void;
+  onInventory?: (items: string[]) => void;
+  onMissionComplete?: (idx: number) => void;
 }
 
 interface Ghost extends Rig {
@@ -292,6 +303,13 @@ export class Engine {
   equippedSuit = "suit-spider";
   private webslingerFound = false;
 
+  // ---- story / mission progression ----
+  private missionIdx = 0;
+  private missionProg: Record<string, number> = {};
+  private missionDone = false;
+  private missionSwingBuf = 0;
+  private missionFlushT = 0;
+
   // touch input (mobile) — held states + joystick; edge actions come through methods
   touch = { joyX: 0, joyY: 0, web: false, glide: false, slide: false };
   private coarse =
@@ -354,6 +372,16 @@ export class Engine {
   private trickAnimT = 0;
   private trickAnimType: "flip" | "spin" = "flip";
   private trickAirTime = 0;
+
+  // ---- player animation state ----
+  private playerRoot = new THREE.Group();
+  private gaitPhase = 0; // accumulated run cycle phase (distance-driven)
+  private climbPhase = 0; // accumulated climb cycle phase
+  private landSquashT = 0; // 1 → 0 landing squash
+  private jumpStretchT = 0; // 1 → 0 takeoff stretch
+  private flinchT = 0; // 1 → 0 hurt flinch
+  private jabT = 0; // 1 → 0 web-shot arm jab
+  private punchArmSide: "L" | "R" = "R"; // alternates jab / cross
 
   // coins / heals / eggs
   private coins = 0;
@@ -444,6 +472,7 @@ export class Engine {
     this.buildWebLines();
     this.buildTokens();
     this.crowd = new Crowd(this.scene, this.city);
+    this.loadStoryProgress();
 
     this.onResize = () => {
       this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -536,7 +565,10 @@ export class Engine {
   private buildPlayer() {
     this.rig = this.buildSpiderRig();
     this.player = this.rig.group;
-    this.scene.add(this.player);
+    // outer root: world placement, facing yaw, squash & stretch, bob.
+    // inner rig group: trick rolls/spins so they never fight the facing yaw.
+    this.playerRoot.add(this.player);
+    this.scene.add(this.playerRoot);
 
     // deployable web-chute (glide parachute)
     const glider = new THREE.Group();
@@ -580,74 +612,212 @@ export class Engine {
   }
 
   /** Shared swing / glide / slide / fall / run posing for the player and ghost rigs. */
+  /**
+   * Full-body animator. Every pose is a set of joint targets; each joint lerps at
+   * its own responsiveness so strikes snap while idle breathing eases.
+   * Positive rotation.x on an arm swings it BACKWARD, negative swings it UP/FORWARD.
+   */
   private applyPose(
     r: Rig,
-    hs: number,
-    velY: number,
-    grounded: boolean,
-    attached: boolean,
-    k: number,
-    sliding = false,
-    gliding = false,
-    climbing = false
-  ) {
-    let armX = 0.15;
-    let armZL = 0.12;
-    let armZR = -0.12;
-    let legX = 0;
-    let legZ = 0.08;
-    const run = grounded && hs > 3;
-    if (climbing) {
-      // clinging to the wall: arms reach up to grip, knees bent against the face
-      const cycle = Math.sin(this.elapsed * 10) * Math.min(1, Math.abs(this.vel.y) / 6);
-      armX = -2.8;
-      armZL = 0.4;
-      armZR = -0.4;
-      legX = 0.95 + cycle * 0.25;
-      legZ = 0.5;
-    } else if (attached) {
-      armX = -2.75;
-      armZL = 0.25;
-      armZR = -0.25;
-      legX = 0.55 + Math.sin(this.elapsed * 9) * 0.12;
-      legZ = 0.22;
-    } else if (gliding && !grounded) {
-      // spread-eagle under the web chute
-      armX = -0.25;
-      armZL = 1.85;
-      armZR = -1.85;
-      legX = 0.25 + Math.sin(this.elapsed * 5) * 0.05;
-      legZ = 0.6;
-    } else if (sliding && grounded) {
-      // low crouch slide — legs kicked forward, arms swept back
-      armX = 0.95;
-      armZL = 0.75;
-      armZR = -0.75;
-      legX = 1.15;
-      legZ = 0.16;
-    } else if (!grounded) {
-      const fall = velY < -6;
-      armX = fall ? -0.9 : -1.5;
-      armZL = fall ? 1.15 : 0.7;
-      armZR = fall ? -1.15 : -0.7;
-      legX = fall ? 0.4 : 0.85;
-      legZ = 0.3;
-    } else if (run) {
-      const sw = Math.sin(this.elapsed * 13) * Math.min(1, hs / 14);
-      legX = sw * 0.95;
-      armX = -sw * 0.7;
-      armZL = 0.18;
-      armZR = -0.18;
-      legZ = 0.1;
+    o: {
+      hs: number;
+      velY: number;
+      grounded: boolean;
+      attached: boolean;
+      k: number;
+      sliding?: boolean;
+      gliding?: boolean;
+      climbing?: boolean;
+      dashT?: number;
+      punchT?: number; // 0 → 1 across the whole punch
+      punchArm?: "L" | "R";
+      jabT?: number; // 0 → 1 web-shot jab
+      trickT?: number; // 0 → 1 flip/spin progress
+      flinchT?: number;
+      gait?: number; // distance-driven run phase
+      climb?: number; // climb cycle phase
+      pitch?: number; // camera pitch, for head aim
     }
-    r.armL.rotation.x += (armX - r.armL.rotation.x) * k;
-    r.armR.rotation.x += (armX - r.armR.rotation.x) * k;
-    r.armL.rotation.z += (armZL - r.armL.rotation.z) * k;
-    r.armR.rotation.z += (armZR - r.armR.rotation.z) * k;
-    r.legL.rotation.x += (legX - r.legL.rotation.x) * k;
-    r.legR.rotation.x += (-legX - r.legR.rotation.x) * k;
-    r.legL.rotation.z += (legZ - r.legL.rotation.z) * k;
-    r.legR.rotation.z += (-legZ - r.legR.rotation.z) * k;
+  ) {
+    // joint targets
+    let aLx = 0.15, aRx = 0.15; // arm pitch (both sides)
+    let aLz = 0.12, aRz = -0.12; // arm splay
+    let lLx = 0, lRx = 0; // leg pitch
+    let lLz = 0.08, lRz = -0.08; // leg splay
+    let torsoX = 0, torsoY = 0; // lean forward+, twist
+    let headX = 0, headY = 0;
+    // per-joint responsiveness (higher = snappier)
+    let kArm = o.k, kLeg = o.k, kTorso = o.k, kHead = o.k;
+
+    const hs = o.hs;
+    const t = this.elapsed;
+
+    if (o.trickT !== undefined && o.trickT > 0) {
+      // ---- trick tuck: knees to chest, arms wrapped ----
+      lLx = -1.9; lRx = -1.9; lLz = 0.25; lRz = -0.25;
+      aLx = -1.15; aRx = -1.15; aLz = -0.85; aRz = 0.85; // crossed over chest
+      torsoX = 0.55;
+      kArm = kLeg = Math.min(1, o.k * 2.4);
+    } else if (o.climbing) {
+      // ---- wall climb: alternating reaches + steps, chest to the wall ----
+      const ph = o.climb ?? 0;
+      const s = Math.sin(ph);
+      aLx = -2.85 + s * 0.55;
+      aRx = -2.85 - s * 0.55;
+      aLz = 0.42; aRz = -0.42;
+      lLx = 1.05 - s * 0.5;
+      lRx = 1.05 + s * 0.5;
+      lLz = 0.45; lRz = -0.45;
+      torsoX = 0.18;
+      headX = -0.25; // looking up for the next hold
+    } else if (o.attached) {
+      // ---- swing: both hands gripping the web overhead, legs stream behind ----
+      const trail = Math.min(1, hs / 34);
+      aLx = -2.72 - 0.1; aRx = -2.72 + 0.1;
+      aLz = 0.08; aRz = -0.08;
+      lLx = 0.4 + trail * 0.55 + Math.sin(t * 9) * 0.1;
+      lRx = 0.4 + trail * 0.55 - Math.sin(t * 9) * 0.1;
+      lLz = 0.18; lRz = -0.18;
+      torsoX = -0.28; // arched back
+      headX = -0.5; // eyes on the anchor
+    } else if (o.gliding && !o.grounded) {
+      // ---- under the web-chute: hands up on the risers, legs dangle ----
+      aLx = -1.05; aRx = -1.05;
+      aLz = 1.45; aRz = -1.45;
+      lLx = 0.15 + Math.sin(t * 5) * 0.07;
+      lRx = 0.15 - Math.sin(t * 5) * 0.07;
+      lLz = 0.32; lRz = -0.32;
+      torsoX = -0.1;
+      headX = -0.15;
+    } else if (o.dashT && o.dashT > 0) {
+      // ---- dash: superman lean, arms swept back, legs together ----
+      aLx = 0.85; aRx = 0.85;
+      aLz = 0.2; aRz = -0.2;
+      lLx = 0.55; lRx = 0.45;
+      lLz = 0.05; lRz = -0.05;
+      torsoX = 0.85;
+      headX = -0.6; // chin up
+      kTorso = Math.min(1, o.k * 2.1);
+    } else if (o.sliding && o.grounded) {
+      // ---- slide: sit back, legs kicked forward and split, trail hand down ----
+      aLx = -0.55; aLz = 0.85; // balance arm up
+      aRx = 0.95; aRz = -0.3; // trail hand near the ground
+      lLx = 1.2; lRx = 1.05;
+      lLz = 0.42; lRz = -0.28;
+      torsoX = -0.5;
+      headX = -0.35;
+    } else if (!o.grounded) {
+      // ---- airborne: rising tuck vs falling spread ----
+      const rising = o.velY > 2;
+      const fall = o.velY < -6;
+      if (rising) {
+        aLx = -1.6; aRx = -1.6; aLz = 0.6; aRz = -0.6;
+        lLx = 0.95; lRx = 0.75; lLz = 0.22; lRz = -0.22;
+        torsoX = 0.12;
+      } else if (fall) {
+        aLx = -0.85; aRx = -0.85; aLz = 1.2; aRz = -1.2;
+        lLx = 0.35 + Math.sin(t * 7) * 0.08;
+        lRx = 0.35 - Math.sin(t * 7) * 0.08;
+        lLz = 0.3; lRz = -0.3;
+        torsoX = -0.15;
+      } else {
+        // apex hang — the classic spider pose
+        aLx = -1.5; aRx = -1.3; aLz = 0.75; aRz = -0.75;
+        lLx = 0.85; lRx = 0.6; lLz = 0.28; lRz = -0.28;
+      }
+      headX = o.velY < 0 ? 0.2 : -0.25;
+    } else if (hs > 2.5) {
+      // ---- run: distance-driven alternating gait + counter-rotation ----
+      const amp = Math.min(1, hs / 16);
+      const ph = o.gait ?? t * 11;
+      const sw = Math.sin(ph);
+      lLx = sw * 0.95 * amp;
+      lRx = -sw * 0.95 * amp;
+      aLx = -sw * 0.85 * amp; // arms oppose legs
+      aRx = sw * 0.85 * amp;
+      aLz = 0.14; aRz = -0.14;
+      lLz = 0.1; lRz = -0.1;
+      torsoX = 0.16 * amp + 0.1 * amp * Math.min(1, hs / 26); // lean into speed
+      torsoY = sw * 0.14 * amp; // shoulders counter-rotate the hips
+      headX = -0.06 * amp;
+    } else {
+      // ---- idle: breathing + subtle weight shift ----
+      const br = Math.sin(t * 2.1);
+      aLx = 0.15 + br * 0.03;
+      aRx = 0.15 - br * 0.03;
+      lLx = br * 0.02;
+      torsoY = Math.sin(t * 0.7) * 0.05;
+      headY = Math.sin(t * 0.5) * 0.1; // looking around
+    }
+
+    // ---- punch layer: windup → strike → recover, alternating jab/cross ----
+    if (o.punchT !== undefined && o.punchT > 0 && o.punchT < 1) {
+      const p = o.punchT;
+      const strike = o.punchArm === "L" ? "L" : "R";
+      // piecewise curve
+      let ext = 0; // 0 = rest, 1 = full extension
+      let wind = 0; // 0 = none, 1 = fully cocked back
+      if (p < 0.22) {
+        wind = p / 0.22;
+      } else if (p < 0.5) {
+        ext = (p - 0.22) / 0.28;
+      } else {
+        ext = 1 - (p - 0.5) / 0.5;
+      }
+      const ex = ext * ext * (3 - 2 * ext); // smoothstep the strike
+      const sX = -1.6 * ex + 0.55 * wind; // back, then snap forward
+      const gX = -0.95 - 0.15 * ex; // guard arm chambers
+      const twist = 0.6 * ex - 0.35 * wind;
+      if (strike === "R") {
+        aRx = sX; aRz = -0.1;
+        aLx = gX; aLz = 0.55;
+        torsoY = twist;
+      } else {
+        aLx = sX; aLz = 0.1;
+        aRx = gX; aRz = -0.55;
+        torsoY = -twist;
+      }
+      torsoX += 0.12 * ex;
+      kArm = Math.min(1, o.k * 3.2); // arms snap
+      kTorso = Math.min(1, o.k * 2.6);
+    }
+
+    // ---- web-shot jab layer (right hand snaps up briefly) ----
+    if (o.jabT && o.jabT > 0) {
+      const j = Math.sin(Math.min(1, o.jabT) * Math.PI);
+      aRx = -1.35 * j;
+      aRz = -0.15;
+      kArm = Math.min(1, o.k * 3);
+    }
+
+    // ---- flinch layer: recoil from a hit ----
+    if (o.flinchT && o.flinchT > 0) {
+      const f = o.flinchT;
+      torsoX += -0.45 * f;
+      headX += 0.5 * f;
+      aLx += -0.9 * f; aRx += -0.9 * f;
+      aLz += 0.3 * f; aRz += -0.3 * f;
+    }
+
+    // head tracks camera pitch on top of the pose
+    if (o.pitch !== undefined) {
+      headX += THREE.MathUtils.clamp(o.pitch * 0.55, -0.55, 0.45);
+    }
+
+    // ---- apply with per-joint smoothing ----
+    const mix = (cur: number, tgt: number, kk: number) => cur + (tgt - cur) * kk;
+    r.armL.rotation.x = mix(r.armL.rotation.x, aLx, kArm);
+    r.armR.rotation.x = mix(r.armR.rotation.x, aRx, kArm);
+    r.armL.rotation.z = mix(r.armL.rotation.z, aLz, kArm);
+    r.armR.rotation.z = mix(r.armR.rotation.z, aRz, kArm);
+    r.legL.rotation.x = mix(r.legL.rotation.x, lLx, kLeg);
+    r.legR.rotation.x = mix(r.legR.rotation.x, lRx, kLeg);
+    r.legL.rotation.z = mix(r.legL.rotation.z, lLz, kLeg);
+    r.legR.rotation.z = mix(r.legR.rotation.z, lRz, kLeg);
+    r.torso.rotation.x = mix(r.torso.rotation.x, torsoX, kTorso);
+    r.torso.rotation.y = mix(r.torso.rotation.y, torsoY, kTorso);
+    r.head.rotation.x = mix(r.head.rotation.x, headX, kHead);
+    r.head.rotation.y = mix(r.head.rotation.y, headY, kHead);
   }
 
   private buildWebLines() {
@@ -729,7 +899,7 @@ export class Engine {
     this.leaveRoom();
     this.maybeSubmitScore();
     this.resetRun();
-    this.player.visible = false;
+    this.playerRoot.visible = false;
     this.setPhase("menu");
   }
 
@@ -855,7 +1025,20 @@ export class Engine {
     this.camGlide = 0;
     this.gliderS = 0;
     if (this.glider) this.glider.visible = false;
-    this.player.scale.set(1, 1, 1);
+    this.playerRoot.scale.set(1, 1, 1);
+    if (this.player) {
+      this.player.rotation.set(0, 0, 0);
+      this.rig.torso.rotation.set(0, 0, 0);
+      this.rig.head.rotation.set(0, 0, 0);
+    }
+    this.gaitPhase = 0;
+    this.climbPhase = 0;
+    this.landSquashT = 0;
+    this.jumpStretchT = 0;
+    this.flinchT = 0;
+    this.jabT = 0;
+    this.trickAnimT = 0;
+    this.trickCount = 0;
     this.keys.clear();
     this.mouseWeb = false;
     // in versus, jitter spawns so rivals don't all drop on the same manhole
@@ -869,7 +1052,7 @@ export class Engine {
     this.camera.position.set(this.pos.x, this.pos.y + 1.4, this.pos.z + 9);
     this.camera.fov = 72;
     this.camera.updateProjectionMatrix();
-    this.player.visible = this.phase !== "menu";
+    this.playerRoot.visible = this.phase !== "menu";
     this.webLine.visible = false;
     this.webGlow.visible = false;
     this.aimLine.visible = false;
@@ -1038,6 +1221,8 @@ export class Engine {
     if (this.phase !== "playing" || this.countdown > 0 || this.punchCooldown > 0) return;
     this.punchCooldown = 0.34;
     this.attackAnim = 1;
+    // alternate jab / cross for a real combo feel
+    this.punchArmSide = this.punchArmSide === "R" ? "L" : "R";
     const dir = this.aimDir(new THREE.Vector3());
     const heavy = !this.grounded;
     const dmg = heavy ? 55 : 32;
@@ -1104,6 +1289,7 @@ export class Engine {
     const bounty = 250 * Math.max(1, this.combo);
     this.score += bounty;
     this.thugsDown++;
+    this.missionInc("thugs", 1);
     this.popupAt(at, `+${bounty} BOUNTY`, "gold");
     this.particles.burst(at, 26, ["#ffcf3f", "#ffffff", "#ff2438"], 11, 1, 3);
     this.hp = Math.min(100, this.hp + 6);
@@ -1114,6 +1300,7 @@ export class Engine {
     this.hp = Math.max(0, this.hp - n);
     this.invulnT = 0.9;
     this.hitFlash = 1;
+    this.flinchT = 1;
     this.shake = Math.min(1.4, this.shake + 0.5);
     this.sfx.hurt();
     const away = _v.set(this.pos.x - from.x, 0, this.pos.z - from.z);
@@ -1203,10 +1390,11 @@ export class Engine {
   private tryWebShot() {
     if (this.phase !== "playing" || this.countdown > 0 || this.webShotCd > 0) return;
     this.webShotCd = 0.22;
+    this.jabT = 1; // arm snaps up
     const dir = this.aimDir(new THREE.Vector3());
     const origin = new THREE.Vector3().copy(this.pos);
-    origin.y += 0.6;
-    origin.addScaledVector(dir, 0.9);
+    origin.y += 1.25; // from the hand, not the feet
+    origin.addScaledVector(dir, 0.8);
     const mesh = new THREE.Mesh(this.webShotGeo, new THREE.MeshBasicMaterial({ color: 0xf6fcff }));
     mesh.position.copy(origin);
     const lineGeo = new THREE.BufferGeometry();
@@ -1370,7 +1558,7 @@ export class Engine {
       (ring.mesh.material as THREE.MeshBasicMaterial).opacity = 0.15;
       (ring.glow.material as THREE.SpriteMaterial).opacity = 0.12;
       this.circuitRingIdx++;
-      this.sfx.token();
+      this.sfx.collect(1);
       this.popupAt(ring.pos.clone().add(new THREE.Vector3(0, 5, 0)), `RING ${this.circuitRingIdx}/${this.circuitRings.length}`, "cyan");
       this.particles.burst(ring.pos, 22, ["#ffffff", "#35e0ff"], 8, 0.6, 2.6);
       if (this.circuitRingIdx >= this.circuitRings.length) this.finishCircuit();
@@ -1382,6 +1570,7 @@ export class Engine {
     if (!c) return;
     const ms = Math.round(this.circuitTime * 1000);
     const beatTarget = this.circuitTime <= c.target;
+    if (beatTarget) this.missionInc("circuit", 1, c.id);
     const prevBest = Number(localStorage.getItem(`websling-tt-${c.id}`) ?? 0);
     const isPb = prevBest === 0 || ms < prevBest;
     if (isPb) localStorage.setItem(`websling-tt-${c.id}`, String(ms));
@@ -1403,6 +1592,7 @@ export class Engine {
   addWallet(n: number) {
     if (n <= 0) return;
     this.wallet += n;
+    this.missionInc("coins", n);
     if (BACKEND_READY && this.authUser) addCoins(this.authUser.id, n).catch(() => undefined);
     this.cbs.onWallet?.(this.wallet);
   }
@@ -1474,11 +1664,75 @@ export class Engine {
     return GLOVES.find((x) => x.id === this.equippedGlove)?.swingBonus ?? 0;
   }
 
+  /* ---------------- story / missions ---------------- */
+  currentMission(): Mission | null {
+    if (this.missionDone || this.missionIdx >= MISSIONS.length) return null;
+    return MISSIONS[this.missionIdx];
+  }
+
+  missionIndex(): number {
+    return this.missionIdx;
+  }
+
+  missionObjectiveProgress(): { obj: ObjectiveDef; cur: number }[] {
+    const m = this.currentMission();
+    if (!m) return [];
+    return m.objectives.map((obj) => ({ obj, cur: Math.min(obj.target, this.missionProg[obj.id] ?? 0) }));
+  }
+
+  private missionInc(kind: ObjectiveDef["kind"], n: number, circuitId?: string) {
+    const m = this.currentMission();
+    if (!m) return;
+    let changed = false;
+    for (const obj of m.objectives) {
+      if (obj.kind !== kind) continue;
+      if (obj.kind === "circuit" && obj.circuitId && obj.circuitId !== circuitId) continue;
+      const cur = this.missionProg[obj.id] ?? 0;
+      if (cur >= obj.target) continue;
+      this.missionProg[obj.id] = Math.min(obj.target, cur + n);
+      changed = true;
+    }
+    if (changed) this.checkMissionComplete();
+  }
+
+  private checkMissionComplete() {
+    const m = this.currentMission();
+    if (!m) return;
+    const done = m.objectives.every((obj) => (this.missionProg[obj.id] ?? 0) >= obj.target);
+    if (!done) return;
+    // grant rewards
+    this.wallet += m.rewardCoins;
+    if (BACKEND_READY && this.authUser) addCoins(this.authUser.id, m.rewardCoins).catch(() => undefined);
+    this.cbs.onWallet?.(this.wallet);
+    if (m.rewardItem) this.unlockItem(m.rewardItem, `Completed ${m.title}`);
+    this.sfx.mission();
+    this.popupAt(this.pos.clone().add(new THREE.Vector3(0, 3, 0)), "CHAPTER COMPLETE", "gold");
+    // advance
+    this.missionIdx++;
+    this.missionProg = {};
+    if (this.missionIdx >= MISSIONS.length) this.missionDone = true;
+    saveProgress({ idx: this.missionIdx, prog: this.missionProg, done: this.missionDone });
+    this.cbs.onMissionComplete?.(this.missionIdx - 1);
+  }
+
+  /** Load persisted story progress (called once on init / after session restore). */
+  loadStoryProgress() {
+    const p = loadProgress();
+    this.missionIdx = p.idx;
+    this.missionProg = p.prog;
+    this.missionDone = p.done;
+    const g = localStorage.getItem("websling-glove");
+    if (g && this.owned.has(g)) this.equippedGlove = g;
+    const s = localStorage.getItem("websling-suit");
+    if (s && this.owned.has(s)) this.equippedSuit = s;
+    this.applyGlove();
+    if (this.equippedSuit !== "suit-spider") this.rebuildPlayerRig();
+  }
+
   private rebuildPlayerRig() {
     const suit = SUITS.find((s) => s.id === this.equippedSuit) ?? SUITS[0];
-    const oldPos = this.player.position.clone();
     const oldRot = this.player.rotation.y;
-    this.scene.remove(this.player);
+    this.playerRoot.remove(this.player);
     this.disposeRig(this.rig);
     this.rig = buildR6Rig({
       head: suit.head,
@@ -1492,9 +1746,10 @@ export class Engine {
       spider: suit.id === "suit-spider",
     });
     this.player = this.rig.group;
-    this.player.position.copy(oldPos);
+    this.player.position.set(0, 0, 0);
     this.player.rotation.y = oldRot;
-    this.scene.add(this.player);
+    this.player.add(this.glider); // keep the web-chute on the fresh rig
+    this.playerRoot.add(this.player);
   }
 
   private disposeRig(rig: Rig) {
@@ -1595,6 +1850,7 @@ export class Engine {
       this.grounded = false;
       this.coyoteT = 0;
       this.jumpBufT = 0;
+      this.jumpStretchT = 1;
       this.sfx.jump();
       this.particles.burst(
         _v.set(this.pos.x, this.pos.y - R + 0.1, this.pos.z),
@@ -1669,6 +1925,17 @@ export class Engine {
 
     this.vel.y -= GRAV * h;
     this.pos.addScaledVector(this.vel, h);
+
+    // story: accumulate web-swing distance
+    if (this.attached) {
+      this.missionSwingBuf += Math.hypot(this.vel.x, this.vel.z) * h;
+      this.missionFlushT += h;
+      if (this.missionFlushT >= 0.5) {
+        this.missionInc("swing", Math.floor(this.missionSwingBuf));
+        this.missionSwingBuf -= Math.floor(this.missionSwingBuf);
+        this.missionFlushT = 0;
+      }
+    }
 
     // rope constraint
     if (this.attached) {
@@ -1763,6 +2030,7 @@ export class Engine {
     if (this.attached && this.attachT > 0.2) this.detach(false);
     this.landTricks();
     const soft = this.gliding;
+    this.landSquashT = soft ? 0.5 : Math.min(1, 0.4 + -fallV / 70);
     if (soft) {
       // parachute touchdown — gentle, and it protects the combo
       this.sfx.thud(false);
@@ -1894,6 +2162,7 @@ export class Engine {
       this.punchCooldown = Math.max(0, this.punchCooldown - dt);
       this.attackAnim = Math.max(0, this.attackAnim - dt * 3.4);
       this.hitFlash = Math.max(0, this.hitFlash - dt * 3);
+      this.trickAnimT = Math.max(0, this.trickAnimT - dt * 2); // one full roll in ~0.5s
       if (this.comboT > 0) {
         this.comboT -= dt;
         if (this.comboT <= 0) this.comboCount = 0;
@@ -1944,6 +2213,7 @@ export class Engine {
           if (this.pos.distanceToSquared(egg.pos) < egg.r * egg.r) {
             this.eggsFound.add(egg.id);
             this.score += 500;
+            this.missionInc("eggs", 1);
             this.sfx.sparkle();
             if (egg.id === "tung") this.sfx.tung();
             this.popupAt(_v.set(this.pos.x, this.pos.y + 2.2, this.pos.z), `EASTER EGG — ${egg.label} +500`, "gold");
@@ -1968,43 +2238,86 @@ export class Engine {
 
   private updateVisuals(dt: number, speed: number) {
     const k = 1 - Math.exp(-13 * dt);
-
-    // player placement + facing
-    this.player.position.set(this.pos.x, this.pos.y - R, this.pos.z);
-    this.player.visible = true;
     const hs = Math.hypot(this.vel.x, this.vel.z);
+
+    // ---- animation timers ----
+    this.gaitPhase += hs * dt * 1.35; // stride rate scales with speed
+    if (this.climbing) this.climbPhase += (Math.abs(this.vel.y) * 1.1 + 2.5) * dt;
+    this.landSquashT = Math.max(0, this.landSquashT - dt * 4.2);
+    this.jumpStretchT = Math.max(0, this.jumpStretchT - dt * 5);
+    this.flinchT = Math.max(0, this.flinchT - dt * 3);
+    this.jabT = Math.max(0, this.jabT - dt * 5.5);
+
+    // ---- root: world placement + facing yaw ----
+    this.playerRoot.position.set(this.pos.x, this.pos.y - R, this.pos.z);
+    this.playerRoot.visible = this.phase !== "menu";
     let targetYaw = this.yaw;
     if (this.climbing) targetYaw = Math.atan2(-this.wallN.x, -this.wallN.z);
     else if (hs > 2.5) targetYaw = Math.atan2(this.vel.x, this.vel.z);
-    let dy = targetYaw - this.player.rotation.y;
+    let dy = targetYaw - this.playerRoot.rotation.y;
     while (dy > Math.PI) dy -= Math.PI * 2;
     while (dy < -Math.PI) dy += Math.PI * 2;
-    this.player.rotation.y += dy * k;
+    this.playerRoot.rotation.y += dy * k;
 
-    this.applyPose(this.rig, hs, this.vel.y, this.grounded, this.attached, k, this.sliding, this.gliding, this.climbing);
+    // run bob: the root bounces with the stride, stronger when sprinting
+    const amp = Math.min(1, hs / 16);
+    const bob = this.grounded && !this.sliding ? Math.abs(Math.sin(this.gaitPhase)) * 0.1 * amp : 0;
+    this.playerRoot.position.y += bob;
 
-    // punch animation: snap the striking arm forward
-    if (this.attackAnim > 0 && !this.attached) {
-      const punch = Math.sin(Math.min(1, this.attackAnim) * Math.PI);
-      const arm = this.grounded ? this.rig.armR : this.rig.armL;
-      arm.rotation.x = -1.45 * punch;
-      arm.rotation.z = 0;
-      this.rig.torso.rotation.y = 0.5 * punch * (this.grounded ? 1 : -1);
-    } else {
-      this.rig.torso.rotation.y *= 0.8;
+    // ---- squash & stretch: landings, jumps, slides ----
+    const squash = Math.sin(Math.PI * Math.min(1, this.landSquashT)) * (this.landSquashT > 0.5 ? 0.32 : 0.32);
+    const stretch = Math.sin(Math.PI * Math.min(1, this.jumpStretchT)) * 0.14;
+    let sy = 1 - squash + stretch;
+    let sxz = 1 + squash * 0.9 - stretch * 0.5;
+    if (this.sliding) {
+      sy = 0.58;
+      sxz = 1.12;
     }
+    this.playerRoot.scale.y += (sy - this.playerRoot.scale.y) * Math.min(1, k * 2.2);
+    this.playerRoot.scale.x += (sxz - this.playerRoot.scale.x) * Math.min(1, k * 2.2);
+    this.playerRoot.scale.z = this.playerRoot.scale.x;
+
+    // ---- trick rotation on the inner rig (never fights the facing yaw) ----
+    const trickT = this.trickAnimT > 0 ? THREE.MathUtils.clamp(1 - this.trickAnimT / 0.5, 0, 1) : 0;
+    if (this.trickAnimT > 0) {
+      const ang = trickT * Math.PI * 2;
+      if (this.trickAnimType === "flip") {
+        this.player.rotation.x = ang;
+        this.player.rotation.y += 0;
+      } else {
+        this.player.rotation.y = ang;
+      }
+    } else {
+      this.player.rotation.x *= 0.75;
+      if (!this.attached && !this.climbing) this.player.rotation.y *= 0.75;
+      else this.player.rotation.y = 0;
+    }
+
+    // ---- pose ----
+    this.applyPose(this.rig, {
+      hs,
+      velY: this.vel.y,
+      grounded: this.grounded,
+      attached: this.attached,
+      k,
+      sliding: this.sliding,
+      gliding: this.gliding,
+      climbing: this.climbing,
+      dashT: this.dashT,
+      punchT: this.attackAnim > 0 && !this.attached ? 1 - this.attackAnim : 0,
+      punchArm: this.punchArmSide,
+      jabT: this.jabT,
+      trickT,
+      flinchT: this.flinchT,
+      gait: this.gaitPhase,
+      climb: this.climbPhase,
+      pitch: this.pitch,
+    });
 
     // hit flash: briefly tint the rig red when damaged
     const flash = this.invulnT > 0.6 ? 0.9 : this.hitFlash * 0.7;
     (this.rig.torso.material as THREE.MeshToonMaterial).emissive.setRGB(flash, flash * 0.1, flash * 0.1);
     (this.rig.head.material as THREE.MeshToonMaterial).emissive.setRGB(flash * 0.6, 0, 0);
-
-    // slide squash & stretch
-    const targetY = this.sliding ? 0.58 : 1;
-    const targetXZ = this.sliding ? 1.12 : 1;
-    this.player.scale.y += (targetY - this.player.scale.y) * k;
-    this.player.scale.x += (targetXZ - this.player.scale.x) * k;
-    this.player.scale.z = this.player.scale.x;
 
     // slide dust trail
     if (this.sliding && speed > 6) {
@@ -2060,7 +2373,7 @@ export class Engine {
     this.blob.scale.set(bs, bs, 1);
 
     // aim + web lines
-    const hand = _v.set(this.pos.x, this.pos.y + 0.55, this.pos.z);
+    const hand = _v.set(this.pos.x, this.pos.y + 1.75, this.pos.z); // raised grip hand
     if (this.attached) {
       this.setLine(this.webLine, hand, this.anchor);
       this.setLine(this.webGlow, hand, this.anchor);
@@ -2401,7 +2714,7 @@ export class Engine {
         while (dy < -Math.PI) dy += Math.PI * 2;
         g.group.rotation.y += dy * kf;
       }
-      this.applyPose(g, hs, g.vel.y, g.grounded, g.attached, kf);
+      this.applyPose(g, { hs, velY: g.vel.y, grounded: g.grounded, attached: g.attached, k: kf, gait: this.elapsed * 11 });
 
       if (g.attached) {
         _v.set(g.pos.x, g.pos.y + 0.55, g.pos.z);
@@ -2424,6 +2737,7 @@ export class Engine {
     t.group.visible = false;
     t.respawn = 2.6;
     this.collected++;
+    this.missionInc("tokens", 1);
     const mult = Math.max(1, this.combo);
     const val = 100 * mult;
     this.score += val;
@@ -2517,7 +2831,21 @@ export class Engine {
       dashReady: this.dashCd <= 0,
       hp: this.hp,
       punchCombo: this.comboCount,
+      mission: this.buildMissionHud(),
     });
+  }
+
+  private buildMissionHud(): MissionHud | null {
+    const m = this.currentMission();
+    if (!m) return null;
+    return {
+      chapter: m.chapter,
+      title: m.title,
+      objectives: m.objectives.map((obj) => {
+        const cur = Math.min(obj.target, this.missionProg[obj.id] ?? 0);
+        return { text: obj.text, cur, target: obj.target, done: cur >= obj.target };
+      }),
+    };
   }
 }
 
