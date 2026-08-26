@@ -1,256 +1,121 @@
-import { getSupabaseClient, SUPABASE_CONFIGURED } from "./net";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-export const BACKEND_READY = SUPABASE_CONFIGURED;
+/**
+ * Persistence layer. localStorage is the source of truth for snappy UX;
+ * when Supabase env vars (or the built-in project defaults) are available,
+ * cash + upgrades also sync to the websling_* tables.
+ */
 
-export interface AccountUser {
-  id: string;
-  email: string;
-  displayName: string | null;
-}
+const SB_URL =
+  (import.meta.env.VITE_SUPABASE_URL as string | undefined) ?? "https://cjelflljzocgpidtrqbg.supabase.co";
+const SB_KEY =
+  (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined) ??
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNqZWxmbGxqem9jZ3BpZHRycWJnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODczNDg0NjYsImV4cCI6MjEwMjkyNDQ2Nn0.-PxUs1IbKvU3r19ToA9HeZEZwwRxFw6koFhr643NNIE";
 
-export interface BoardRow {
-  userId: string;
-  name: string;
-  mode: string;
-  score: number;
-  tokens: number;
-  maxCombo: number;
-  bestSwing: number;
-  at: string;
-}
-
-export interface ScoreEntry {
-  mode: "solo" | "free" | "versus" | "circuit";
-  score: number;
-  tokens: number;
-  maxCombo: number;
-  bestSwing: number;
-  timeLeft: number;
-  placement: number | null;
-}
-
-function client(): SupabaseClient {
-  const c = getSupabaseClient();
-  if (!c) throw new Error("Supabase is not configured.");
-  return c;
-}
-
-function friendly(msg: string): string {
-  const m = msg.toLowerCase();
-  if (m.includes("invalid login credentials")) return "Wrong email or password.";
-  if (m.includes("already registered")) return "That email already has a pilot account — sign in instead.";
-  if (m.includes("rate limit")) return "Too many attempts — wait a moment and retry.";
-  if (m.includes("email not confirmed"))
-    return "Confirm your email first (or disable email confirmation in Supabase Auth settings).";
-  if (m.includes("password should be")) return "Password must be at least 6 characters.";
-  if (m.includes("unable to validate email")) return "That email address doesn't look valid.";
-  return msg;
-}
-
-async function fetchDisplayName(uid: string): Promise<string | null> {
+let client: SupabaseClient | null = null;
+function sb(): SupabaseClient | null {
   try {
-    const { data } = await client()
-      .from("websling_profiles")
-      .select("display_name")
-      .eq("user_id", uid)
-      .maybeSingle();
-    return ((data?.display_name as string | undefined) ?? null);
+    if (!client) client = createClient(SB_URL, SB_KEY);
+    return client;
   } catch {
     return null;
   }
 }
 
-async function ensureProfile(uid: string, displayName: string): Promise<void> {
+const CASH_KEY = "websling-cash";
+const UPGRADE_KEY = "websling-upgrades";
+const GUEST_KEY = "websling-guest-id";
+
+function guestId(): string {
+  let id = localStorage.getItem(GUEST_KEY);
+  if (!id) {
+    id = "g-" + Math.random().toString(36).slice(2, 10);
+    localStorage.setItem(GUEST_KEY, id);
+  }
+  return id;
+}
+
+/* ---------------- cash ---------------- */
+
+export function loadCash(): number {
   try {
-    await client()
-      .from("websling_profiles")
-      .upsert({ user_id: uid, display_name: displayName }, { onConflict: "user_id", ignoreDuplicates: true });
+    return Number(localStorage.getItem(CASH_KEY)) || 0;
   } catch {
-    /* profile may already exist via the signup trigger */
+    return 0;
   }
 }
 
-/* ---------------- session ---------------- */
-
-export async function getSession(): Promise<AccountUser | null> {
-  if (!BACKEND_READY) return null;
-  const { data } = await client().auth.getSession();
-  const u = data.session?.user;
-  if (!u) return null;
-  return { id: u.id, email: u.email ?? "", displayName: await fetchDisplayName(u.id) };
-}
-
-export function onAuthChange(cb: (user: AccountUser | null) => void): () => void {
-  if (!BACKEND_READY) return () => {};
-  const { data } = client().auth.onAuthStateChange((_evt, session) => {
-    const u = session?.user;
-    if (!u) {
-      cb(null);
-      return;
-    }
-    const acc: AccountUser = { id: u.id, email: u.email ?? "", displayName: null };
-    cb(acc);
-    fetchDisplayName(u.id).then((n) => cb({ ...acc, displayName: n }));
-  });
-  return () => data.subscription.unsubscribe();
-}
-
-/* ---------------- auth ---------------- */
-
-export async function signUp(email: string, password: string, displayName: string): Promise<AccountUser> {
-  const clean = displayName.trim().slice(0, 14) || "SPIDER";
-  const { data, error } = await client().auth.signUp({
-    email: email.trim(),
-    password,
-    options: { data: { display_name: clean } },
-  });
-  if (error) throw new Error(friendly(error.message));
-  const u = data.user;
-  if (!u) throw new Error("Sign-up failed — try again.");
-  if (data.session) await ensureProfile(u.id, clean);
-  return { id: u.id, email: u.email ?? email, displayName: clean };
-}
-
-export async function signIn(email: string, password: string): Promise<AccountUser> {
-  const { data, error } = await client().auth.signInWithPassword({ email: email.trim(), password });
-  if (error) throw new Error(friendly(error.message));
-  const u = data.user;
-  return { id: u.id, email: u.email ?? email, displayName: await fetchDisplayName(u.id) };
-}
-
-export async function signOutUser(): Promise<void> {
-  if (!BACKEND_READY) return;
+/** Persist the new total locally and fire-and-forget a sync to Supabase. */
+export function saveCash(total: number): void {
   try {
-    await client().auth.signOut();
+    localStorage.setItem(CASH_KEY, String(total));
   } catch {
-    /* already out */
+    /* ignore */
   }
-}
-
-export async function updateDisplayName(uid: string, name: string): Promise<string> {
-  const clean = name.trim().slice(0, 14) || "SPIDER";
-  const { error } = await client().from("websling_profiles").update({ display_name: clean }).eq("user_id", uid);
-  if (error) throw new Error(friendly(error.message));
-  return clean;
-}
-
-/* ---------------- scores ---------------- */
-
-export async function submitScore(uid: string, entry: ScoreEntry): Promise<void> {
-  await ensureProfile(uid, "SPIDER");
-  const { error } = await client().from("websling_scores").insert({
-    user_id: uid,
-    mode: entry.mode,
-    score: entry.score,
-    tokens: entry.tokens,
-    max_combo: entry.maxCombo,
-    best_swing: entry.bestSwing,
-    time_left: entry.timeLeft,
-    placement: entry.placement,
-  });
-  if (error) throw new Error(friendly(error.message));
-}
-
-export async function fetchLeaderboard(mode: "solo" | "free" | "versus" | "circuit" | "all"): Promise<BoardRow[]> {
-  const { data, error } = await client().rpc("websling_leaderboard", {
-    p_mode: mode === "all" ? null : mode,
-    p_limit: 100,
-  });
-  if (error) throw new Error(friendly(error.message));
-  const rows = (data as Array<Record<string, unknown>>) ?? [];
-  return rows.map((r) => ({
-    userId: String(r.user_id ?? ""),
-    name: String(r.display_name ?? "SPIDER"),
-    mode: String(r.mode ?? "solo"),
-    score: Number(r.score ?? 0),
-    tokens: Number(r.tokens ?? 0),
-    maxCombo: Number(r.max_combo ?? 0),
-    bestSwing: Number(r.best_swing ?? 0),
-    at: String(r.created_at ?? ""),
-  }));
-}
-
-/* ---------------- coins (persistent wallet) ---------------- */
-
-/* ---------------- inventory ---------------- */
-
-export async function fetchInventory(uid: string): Promise<string[]> {
-  const { data } = await client().from("websling_inventory").select("item_id").eq("user_id", uid);
-  return ((data as Array<{ item_id: string }> | null) ?? []).map((r) => r.item_id);
-}
-
-export async function grantItem(uid: string, itemId: string): Promise<void> {
-  const { error } = await client().rpc("websling_grant_item", { p_item: itemId });
-  if (error) throw new Error(friendly(error.message));
-}
-
-/* ---------------- time trials ---------------- */
-
-export interface TrialRow {
-  userId: string;
-  name: string;
-  trialId: string;
-  timeMs: number;
-}
-
-/** Global best per trial, joined with callsigns. */
-export async function fetchTrialsGlobal(): Promise<TrialRow[]> {
-  const { data, error } = await client().from("websling_trials").select("user_id, trial_id, time_ms");
-  if (error) throw new Error(friendly(error.message));
-  const rows = (data as Array<{ user_id: string; trial_id: string; time_ms: number }>) ?? [];
-  // best per (trial) globally
-  const bestByTrial = new Map<string, { user_id: string; time_ms: number }>();
-  for (const r of rows) {
-    const cur = bestByTrial.get(r.trial_id);
-    if (!cur || r.time_ms < cur.time_ms) bestByTrial.set(r.trial_id, r);
-  }
-  // best per pilot per trial (for "your best")
-  const out: TrialRow[] = [];
-  const nameCache = new Map<string, string>();
-  for (const [trialId, r] of bestByTrial) {
-    let name = nameCache.get(r.user_id);
-    if (name === undefined) {
-      name = (await fetchDisplayName(r.user_id)) ?? "SPIDER";
-      nameCache.set(r.user_id, name);
+  const c = sb();
+  if (!c) return;
+  void (async () => {
+    try {
+      await c.from("websling_wallet").upsert({ owner: guestId(), cash: total, updated_at: new Date().toISOString() });
+    } catch {
+      /* offline is fine */
     }
-    out.push({ userId: r.user_id, name, trialId, timeMs: r.time_ms });
+  })();
+}
+
+/** Pull the cloud total (if any) and keep the richer of the two. */
+export async function syncCash(local: number): Promise<number> {
+  const c = sb();
+  if (!c) return local;
+  try {
+    const { data } = await c.from("websling_wallet").select("cash").eq("owner", guestId()).maybeSingle();
+    const remote = Number((data as { cash?: number } | null)?.cash ?? 0);
+    const merged = Math.max(local, remote);
+    if (merged !== local) saveCash(merged);
+    return merged;
+  } catch {
+    return local;
   }
-  return out;
 }
 
-/** Submit a trial time (server keeps the best). Returns the pilot's best in ms. */
-export async function setTrialTime(uid: string, trialId: string, ms: number): Promise<number> {
-  const { data, error } = await client().rpc("websling_set_trial", { p_trial: trialId, p_ms: ms });
-  if (error) throw new Error(friendly(error.message));
-  return Number(data ?? ms);
+/* ---------------- upgrades ---------------- */
+
+export function loadUpgrades(): Record<string, number> {
+  try {
+    return JSON.parse(localStorage.getItem(UPGRADE_KEY) ?? "{}") as Record<string, number>;
+  } catch {
+    return {};
+  }
 }
 
-/* ---------------- coin spending ---------------- */
-
-export async function spendCoins(uid: string, amount: number): Promise<number> {
-  const { data, error } = await client().rpc("websling_spend_coins", { p_amount: amount });
-  if (error) throw new Error(friendly(error.message));
-  const bal = Number(data ?? -1);
-  if (bal < 0) throw new Error("Not enough coins in your web-wallet.");
-  return bal;
+export function saveUpgrades(u: Record<string, number>): void {
+  try {
+    localStorage.setItem(UPGRADE_KEY, JSON.stringify(u));
+  } catch {
+    /* ignore */
+  }
+  const c = sb();
+  if (!c) return;
+  void (async () => {
+    try {
+      await c.from("websling_wallet").upsert({ owner: guestId(), upgrades: u, updated_at: new Date().toISOString() });
+    } catch {
+      /* offline is fine */
+    }
+  })();
 }
 
-export async function fetchCoins(uid: string): Promise<number> {
-  const { data } = await client().from("websling_profiles").select("coins").eq("user_id", uid).maybeSingle();
-  return Number((data as { coins?: number } | null)?.coins ?? 0);
-}
-
-export async function addCoins(uid: string, amount: number): Promise<number> {
-  if (amount <= 0) return 0;
-  const { data, error } = await client().rpc("websling_add_coins", { p_amount: amount });
-  if (error) throw new Error(friendly(error.message));
-  return Number(data ?? 0);
-}
-
-export async function fetchMyBest(mode: "solo" | "free" | "versus" | "circuit" | "all", uid: string): Promise<number | null> {
-  let q = client().from("websling_scores").select("score").eq("user_id", uid);
-  if (mode !== "all") q = q.eq("mode", mode);
-  const { data } = await q.order("score", { ascending: false }).limit(1).maybeSingle();
-  return data ? Number((data as { score: number }).score) : null;
+export async function syncUpgrades(local: Record<string, number>): Promise<Record<string, number>> {
+  const c = sb();
+  if (!c) return local;
+  try {
+    const { data } = await c.from("websling_wallet").select("upgrades").eq("owner", guestId()).maybeSingle();
+    const remote = ((data as { upgrades?: Record<string, number> } | null)?.upgrades ?? {}) as Record<string, number>;
+    const merged: Record<string, number> = { ...remote };
+    for (const k of Object.keys(local)) merged[k] = Math.max(local[k] ?? 0, remote[k] ?? 0);
+    saveUpgrades(merged);
+    return merged;
+  } catch {
+    return local;
+  }
 }

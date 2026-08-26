@@ -1,45 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Engine,
-  type HudData,
-  type Mode,
-  type Phase,
-  type PopupData,
-  type RunStats,
-  type Standing,
-} from "./game/engine";
-import { randomCode, type NetStatus } from "./game/net";
-import {
-  BACKEND_READY,
-  fetchLeaderboard,
-  fetchMyBest,
-  getSession,
-  onAuthChange,
-  signIn,
-  signOutUser,
-  signUp,
-  updateDisplayName,
-  type AccountUser,
-  type BoardRow,
-} from "./game/backend";
-import {
-  AccountModal,
-  EndScreen,
-  Hud,
-  LeaderboardScreen,
-  LobbyScreen,
-  MissionBriefing,
-  MissionComplete,
-  PauseScreen,
-  Popups,
-  StartScreen,
-  Toast,
-} from "./components/ui";
+import { Engine, type HudData, type Mode, type Phase, type PopupData, type RunStats } from "./game/engine";
+import type { DealerSnapshot } from "./game/dealers";
+import { EndScreen, Hud, PauseScreen, Popups, ShopScreen, StartScreen, Toast } from "./components/ui";
 import { MobileControls } from "./components/MobileControls";
-import { MISSIONS, type Mission } from "./game/story";
 
-const BEST_KEY = "webrunner-best-score";
-const NAME_KEY = "webrunner-name";
+const BEST_KEY = "websling-best-score";
 
 const initialHud: HudData = {
   score: 0,
@@ -52,22 +17,15 @@ const initialHud: HudData = {
   attached: false,
   muted: false,
   anchor: null,
-  mode: "solo",
-  countdown: 0,
-  standings: [],
-  roomCode: null,
-  sliding: false,
-  gliding: false,
-  climbing: false,
-  dashReady: true,
+  mode: "free",
   hp: 100,
+  maxHp: 100,
+  cash: 0,
+  power: null,
+  powerPip: null,
+  dealerNear: null,
   punchCombo: 0,
-  mission: null,
 };
-
-type BoardMode = "solo" | "free" | "versus" | "all";
-
-const backendApi = { signUp, signIn, updateDisplayName };
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -76,6 +34,8 @@ export default function App() {
   const [hud, setHud] = useState<HudData>(initialHud);
   const [popups, setPopups] = useState<PopupData[]>([]);
   const [stats, setStats] = useState<RunStats | null>(null);
+  const [shop, setShop] = useState<DealerSnapshot | null>(null);
+  const [toast, setToast] = useState<{ id: number; msg: string } | null>(null);
   const [best, setBest] = useState<number>(() => {
     try {
       return Number(localStorage.getItem(BEST_KEY)) || 0;
@@ -84,48 +44,14 @@ export default function App() {
     }
   });
   const [isNewBest, setIsNewBest] = useState(false);
-  const [muted, setMuted] = useState(false);
 
-  // touch device? show the on-screen controls
   const isTouch = useMemo(
-    () =>
-      typeof window !== "undefined" &&
-      (window.matchMedia("(pointer: coarse)").matches || "ontouchstart" in window),
+    () => typeof window !== "undefined" && (window.matchMedia("(pointer: coarse)").matches || "ontouchstart" in window),
     []
   );
 
-  // versus lobby state
-  const [lobbyOpen, setLobbyOpen] = useState(false);
-  const [code, setCode] = useState(() => randomCode());
-  const [name, setName] = useState(() => {
-    try {
-      return localStorage.getItem(NAME_KEY) || "";
-    } catch {
-      return "";
-    }
-  });
-  const [joined, setJoined] = useState(false);
-  const [netStatus, setNetStatus] = useState<NetStatus>("off");
-  const [roster, setRoster] = useState<Standing[]>([]);
-
-  // accounts / leaderboard state
-  const [account, setAccount] = useState<AccountUser | null>(null);
-  const [acctOpen, setAcctOpen] = useState(false);
-  const [boardOpen, setBoardOpen] = useState(false);
-  const [boardMode, setBoardMode] = useState<BoardMode>("all");
-  const [boardRows, setBoardRows] = useState<BoardRow[]>([]);
-  const [boardLoading, setBoardLoading] = useState(false);
-  const [myBest, setMyBest] = useState<number | null>(null);
-  const [refreshTick, setRefreshTick] = useState(0);
-  const [toast, setToast] = useState<{ id: number; msg: string } | null>(null);
-
-  // story / mission state
-  const [briefing, setBriefing] = useState<Mission | null>(null);
-  const [completed, setCompleted] = useState<{ mission: Mission; next: Mission | null } | null>(null);
-  const briefedRef = useRef<Set<number>>(new Set());
-
   useEffect(() => {
-    if (!canvasRef.current) return;
+    if (!canvasRef.current || engineRef.current) return;
     const engine = new Engine(canvasRef.current, {
       onHud: setHud,
       onPopup: (p) => {
@@ -134,15 +60,10 @@ export default function App() {
       },
       onPhase: (p, s) => {
         setPhase(p);
-        if (p === "menu") {
-          setLobbyOpen(false);
-          setJoined(false);
-          setRoster([]);
-          setNetStatus("off");
-        }
+        if (p !== "playing") setShop(null);
         if (s && (p === "won" || p === "lost")) {
           setStats(s);
-          if (s.mode !== "versus") {
+          if (s.mode === "solo") {
             setBest((prevBest) => {
               const nb = s.score > prevBest;
               setIsNewBest(nb);
@@ -157,15 +78,13 @@ export default function App() {
           } else {
             setIsNewBest(false);
           }
-          // a finished run may have posted a new leaderboard entry
-          if (BACKEND_READY) setRefreshTick((t) => t + 1);
         }
       },
-      onRoster: setRoster,
-      onNetStatus: setNetStatus,
-      onToast: (msg) => setToast({ id: Date.now(), msg }),
-      onMissionComplete: (idx) => {
-        setCompleted({ mission: MISSIONS[idx], next: MISSIONS[idx + 1] ?? null });
+      onShop: setShop,
+      onToast: (msg) => {
+        const id = Date.now() + Math.random();
+        setToast({ id, msg });
+        window.setTimeout(() => setToast((t) => (t && t.id === id ? null : t)), 1800);
       },
     });
     engineRef.current = engine;
@@ -175,100 +94,12 @@ export default function App() {
     };
   }, []);
 
-  // restore + track the pilot session
-  useEffect(() => {
-    if (!BACKEND_READY) return;
-    getSession().then(setAccount).catch(() => {});
-    const unsub = onAuthChange(setAccount);
-    return unsub;
-  }, []);
-
-  // prefill the versus callsign from the account
-  useEffect(() => {
-    if (account?.displayName && !name.trim()) setName(account.displayName);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account]);
-
-  // toast auto-dismiss
-  useEffect(() => {
-    if (!toast) return;
-    const t = window.setTimeout(() => setToast(null), 2600);
-    return () => window.clearTimeout(t);
-  }, [toast]);
-
-  // leaderboard fetch
-  useEffect(() => {
-    if (!boardOpen || !BACKEND_READY) return;
-    let live = true;
-    setBoardLoading(true);
-    (async () => {
-      try {
-        const [rows, mine] = await Promise.all([
-          fetchLeaderboard(boardMode),
-          account ? fetchMyBest(boardMode, account.id) : Promise.resolve(null),
-        ]);
-        if (!live) return;
-        setBoardRows(rows);
-        setMyBest(mine);
-      } catch {
-        if (live) setBoardRows([]);
-      } finally {
-        if (live) setBoardLoading(false);
-      }
-    })();
-    return () => {
-      live = false;
-    };
-  }, [boardOpen, boardMode, account, refreshTick]);
-
-  // story: show the chapter briefing whenever we're in the menu with an un-briefed mission
-  useEffect(() => {
-    if (phase !== "menu" || briefing || completed) return;
-    const eng = engineRef.current;
-    if (!eng) return;
-    const m = eng.currentMission();
-    if (m && !briefedRef.current.has(eng.missionIndex())) {
-      setBriefing(m);
-    }
-  }, [phase, briefing, completed]);
-
   const blurActive = () => (document.activeElement as HTMLElement | null)?.blur?.();
 
-  const pickMode = useCallback((m: Mode) => {
+  const startMode = useCallback((m: Mode) => {
     blurActive();
-    if (m === "versus") {
-      setLobbyOpen(true);
-    } else {
-      engineRef.current?.startRun(m);
-    }
+    engineRef.current?.startRun(m);
   }, []);
-
-  const joinRoom = useCallback(() => {
-    blurActive();
-    const finalName = name.trim() || `SPIDER-${Math.floor(Math.random() * 900) + 100}`;
-    setName(finalName);
-    try {
-      localStorage.setItem(NAME_KEY, finalName);
-    } catch {
-      /* ignore */
-    }
-    engineRef.current?.joinRoom(code, finalName);
-    setJoined(true);
-  }, [code, name]);
-
-  const leaveLobby = useCallback(() => {
-    blurActive();
-    engineRef.current?.leaveRoom();
-    setLobbyOpen(false);
-    setJoined(false);
-  }, []);
-
-  const startVersus = useCallback(() => {
-    blurActive();
-    engineRef.current?.startRun("versus");
-    setLobbyOpen(false);
-  }, []);
-
   const resume = useCallback(() => {
     blurActive();
     engineRef.current?.resume();
@@ -281,132 +112,31 @@ export default function App() {
     blurActive();
     engineRef.current?.toMenu();
   }, []);
-  const toggleMute = useCallback(() => {
-    blurActive();
-    engineRef.current?.toggleMute();
+  const buy = useCallback((kind: "power" | "heal" | "soda" | "upgrade", slot: number) => {
+    engineRef.current?.buy(kind, slot);
+  }, []);
+  const closeShop = useCallback(() => {
+    engineRef.current?.closeShop();
   }, []);
 
-  const openBoard = useCallback((m?: BoardMode) => {
-    blurActive();
-    if (m) setBoardMode(m);
-    setBoardOpen(true);
-  }, []);
-
-  const handleSignedIn = useCallback((u: AccountUser) => {
-    setAccount(u);
-    setAcctOpen(false);
-    setToast({ id: Date.now(), msg: `WELCOME, ${(u.displayName ?? "PILOT").toUpperCase()}` });
-  }, []);
-
-  const handleSignOut = useCallback(async () => {
-    await signOutUser();
-    setAccount(null);
-    setAcctOpen(false);
-    setToast({ id: Date.now(), msg: "SIGNED OUT" });
-  }, []);
+  const inGame = phase === "playing" || phase === "paused";
 
   return (
     <div className="fixed inset-0 bg-ink overflow-hidden">
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
+      <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
 
-      {(phase === "playing" || phase === "paused") && <Hud hud={hud} />}
-      {phase === "playing" && <Popups popups={popups} />}
-      {isTouch && phase === "playing" && engineRef.current && (
-        <MobileControls engine={engineRef.current} />
-      )}
+      {inGame && <Hud hud={hud} />}
+      {phase === "playing" && !shop && <Popups popups={popups} />}
+      {isTouch && phase === "playing" && !shop && engineRef.current && <MobileControls engine={engineRef.current} />}
 
-      {phase === "menu" && lobbyOpen && (
-        <LobbyScreen
-          code={code}
-          onCode={setCode}
-          name={name}
-          onName={setName}
-          joined={joined}
-          status={netStatus}
-          roster={roster}
-          onJoin={joinRoom}
-          onNewCode={() => {
-            setCode(randomCode());
-            blurActive();
-          }}
-          onStart={startVersus}
-          onBack={leaveLobby}
-        />
-      )}
-      {phase === "menu" && !lobbyOpen && (
-        <StartScreen
-          best={best}
-          onMode={pickMode}
-          account={account}
-          backendOn={BACKEND_READY}
-          onAccount={() => setAcctOpen(true)}
-          onBoard={() => openBoard()}
-        />
-      )}
-      {phase === "paused" && (
-        <PauseScreen onResume={resume} onRestart={restart} onMenu={toMenu} muted={muted} onMute={toggleMute} />
-      )}
+      {phase === "menu" && <StartScreen best={best} onMode={startMode} />}
+      {phase === "paused" && <PauseScreen onResume={resume} onRestart={restart} onMenu={toMenu} />}
+      {phase === "playing" && shop && <ShopScreen snap={shop} onBuy={buy} onClose={closeShop} />}
       {(phase === "won" || phase === "lost") && stats && (
-        <EndScreen
-          won={phase === "won"}
-          stats={stats}
-          best={best}
-          isNewBest={isNewBest}
-          onRetry={restart}
-          onMenu={toMenu}
-          onBoard={
-            BACKEND_READY
-              ? () => openBoard(stats.mode === "circuit" ? "free" : stats.mode === "free" ? "free" : stats.mode)
-              : undefined
-          }
-        />
+        <EndScreen won={phase === "won"} stats={stats} best={best} isNewBest={isNewBest} onRetry={restart} onMenu={toMenu} />
       )}
 
-      {acctOpen && (
-        <AccountModal
-          account={account}
-          backend={backendApi}
-          onClose={() => setAcctOpen(false)}
-          onSignedIn={handleSignedIn}
-          onSignOut={handleSignOut}
-        />
-      )}
-      {boardOpen && (
-        <LeaderboardScreen
-          mode={boardMode}
-          onMode={setBoardMode}
-          rows={boardRows}
-          loading={boardLoading}
-          myBest={myBest}
-          account={account}
-          onRefresh={() => setRefreshTick((t) => t + 1)}
-          onClose={() => setBoardOpen(false)}
-        />
-      )}
-
-      {briefing && (
-        <MissionBriefing
-          mission={briefing}
-          onStart={() => {
-            briefedRef.current.add(engineRef.current?.missionIndex() ?? 0);
-            setBriefing(null);
-            engineRef.current?.startRun("free");
-          }}
-        />
-      )}
-      {completed && (
-        <MissionComplete
-          mission={completed.mission}
-          nextMission={completed.next}
-          onContinue={() => {
-            setCompleted(null);
-            const next = engineRef.current?.currentMission();
-            if (next) setBriefing(next);
-          }}
-        />
-      )}
-
-      {toast && <Toast key={toast.id} msg={toast.msg} />}
+      {toast && <Toast msg={toast} />}
     </div>
   );
 }

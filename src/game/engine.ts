@@ -1,39 +1,41 @@
 import * as THREE from "three";
-import { City, WORLD_SPAN, type Box } from "./world";
+import { City, makeTextSprite, MAX_ROOF, type Box, type EggSpot } from "./world";
 import { Sfx } from "./audio";
-import { createRoomTransport, randomPid, type NetPacket, type NetStatus, type RoomTransport } from "./net";
-import { BACKEND_READY, onAuthChange, submitScore, type AccountUser } from "./backend";
-import { buildR6Rig, spiderStyle, type Rig } from "./rig";
+import { buildR6Rig, disposeRig, spiderStyle, type Rig, type RigStyle } from "./rig";
 import { Crowd, type PunchEvent } from "./npcs";
-import { loadProgress, MISSIONS, saveProgress, type Mission, type ObjectiveDef } from "./story";
-import { CIRCUITS, GLOVES, SUITS, type Circuit } from "./catalog";
+import { PowerSpawner, POWERS, type PowerDef, type PowerMove } from "./powers";
 import {
-  addCoins,
-  fetchCoins,
-  fetchInventory,
-  grantItem,
-  setTrialTime,
-  spendCoins,
-} from "./backend";
+  Market,
+  DEALERS,
+  UPGRADES,
+  upgradePrice,
+  HEAL_PRICE,
+  SODA_PRICE,
+  HEAL_AMOUNT,
+  type DealerSnapshot,
+  type Rarity,
+} from "./dealers";
+import { RARITY } from "./dealers";
+import { loadCash, saveCash, syncCash, loadUpgrades, saveUpgrades, syncUpgrades } from "./backend";
+import { POST_VERT, POST_FRAG } from "./post";
 
 export type Phase = "menu" | "playing" | "paused" | "won" | "lost";
-/** "versus" is kept internally for the net/standings machinery; free play auto-links globally. */
-export type Mode = "solo" | "free" | "versus" | "circuit";
-
-export interface Standing {
-  pid: string;
-  name: string;
-  color: string;
-  score: number;
-  tokens: number;
-  you: boolean;
-}
+export type Mode = "free" | "solo";
 
 export interface AnchorPip {
   x: number;
   y: number;
-  ok: boolean;
   sky: boolean;
+}
+
+export interface PowerHud {
+  name: string;
+  rarity: Rarity;
+  color: string;
+  glow: string;
+  energy: number;
+  maxEnergy: number;
+  moves: { key: string; name: string; cd: number; maxCd: number; cost: number }[];
 }
 
 export interface HudData {
@@ -48,22 +50,13 @@ export interface HudData {
   muted: boolean;
   anchor: AnchorPip | null;
   mode: Mode;
-  countdown: number;
-  standings: Standing[];
-  roomCode: string | null;
-  sliding: boolean;
-  gliding: boolean;
-  climbing: boolean;
-  dashReady: boolean;
   hp: number;
+  maxHp: number;
+  cash: number;
+  power: PowerHud | null;
+  powerPip: { x: number; y: number; glow: string; name: string } | null;
+  dealerNear: string | null;
   punchCombo: number;
-  mission: MissionHud | null;
-}
-
-export interface MissionHud {
-  chapter: string;
-  title: string;
-  objectives: { text: string; cur: number; target: number; done: boolean }[];
 }
 
 export interface PopupData {
@@ -71,7 +64,7 @@ export interface PopupData {
   x: number;
   y: number;
   text: string;
-  kind: "gold" | "cyan" | "red";
+  kind: "gold" | "red" | "cyan" | "cash";
 }
 
 export interface RunStats {
@@ -81,8 +74,6 @@ export interface RunStats {
   bestSwing: number;
   timeLeft: number;
   mode: Mode;
-  placement: number;
-  standings: Standing[];
   ko: boolean;
   thugsDown: number;
 }
@@ -91,177 +82,216 @@ export interface EngineCallbacks {
   onHud: (h: HudData) => void;
   onPopup: (p: PopupData) => void;
   onPhase: (phase: Phase, stats: RunStats | null) => void;
-  onRoster: (list: Standing[]) => void;
-  onNetStatus: (s: NetStatus) => void;
-  onToast?: (msg: string) => void;
-  onWallet?: (coins: number) => void;
-  onInventory?: (items: string[]) => void;
-  onMissionComplete?: (idx: number) => void;
+  onShop: (s: DealerSnapshot | null) => void;
+  onToast: (msg: string) => void;
 }
 
-interface Ghost extends Rig {
-  pid: string;
-  name: string;
-  color: string;
-  pos: THREE.Vector3;
-  target: THREE.Vector3;
-  vel: THREE.Vector3;
-  yaw: number;
-  attached: boolean;
-  anchor: THREE.Vector3;
-  grounded: boolean;
-  score: number;
-  combo: number;
-  tokens: number;
-  lastSeen: number;
-  webLine: THREE.Line;
-  tag: THREE.Sprite;
-  glowSprite: THREE.Sprite;
-  fade: number;
-}
-
-const GOAL = 20;
-const RUN_TIME = 120;
-const R = 0.9; // player collision radius
+const R = 0.95;
 const GRAV = 30;
+const RUN_TIME = 120;
+const GOAL = 20;
 const STEP = 1 / 120;
 
-interface Token {
-  group: THREE.Group;
-  baseY: number;
-  phase: number;
-  active: boolean;
-  respawn: number;
+const _v = new THREE.Vector3();
+const _f = new THREE.Vector3();
+const _t = new THREE.Vector3();
+const _d = new THREE.Vector3();
+const _u = new THREE.Vector3();
+const _r = new THREE.Vector3();
+const _n = new THREE.Vector3();
+
+function rayBoxT(o: THREE.Vector3, d: THREE.Vector3, b: Box): number {
+  const ex = b.hx + 0.4;
+  const ez = b.hz + 0.4;
+  let tmin = 0;
+  let tmax = Infinity;
+  for (const axis of ["x", "y", "z"] as const) {
+    const oA = o[axis];
+    const dA = d[axis];
+    let lo: number;
+    let hi: number;
+    if (axis === "y") {
+      lo = b.y0 ?? 0;
+      hi = b.top;
+    } else if (axis === "x") {
+      lo = b.cx - ex;
+      hi = b.cx + ex;
+    } else {
+      lo = b.cz - ez;
+      hi = b.cz + ez;
+    }
+    if (Math.abs(dA) < 1e-9) {
+      if (oA < lo || oA > hi) return -1;
+    } else {
+      let t1 = (lo - oA) / dA;
+      let t2 = (hi - oA) / dA;
+      if (t1 > t2) [t1, t2] = [t2, t1];
+      tmin = Math.max(tmin, t1);
+      tmax = Math.min(tmax, t2);
+      if (tmin > tmax) return -1;
+    }
+  }
+  return tmin;
 }
 
-interface CircuitRing {
-  mesh: THREE.Mesh;
-  glow: THREE.Sprite;
-  pos: THREE.Vector3;
-  hit: boolean;
-}
-
-/* ---------------- particles ---------------- */
+/* ---------------- pooled particles ---------------- */
 class Particles {
-  max = 460;
-  pos: Float32Array;
-  vel: Float32Array;
-  life: Float32Array;
-  maxLife: Float32Array;
-  baseCol: Float32Array;
-  col: Float32Array;
-  geo = new THREE.BufferGeometry();
-  points: THREE.Points;
-  cursor = 0;
+  private points: THREE.Points;
+  private pos: Float32Array;
+  private col: Float32Array;
+  private vel: Float32Array;
+  private life: Float32Array;
+  private maxLife: Float32Array;
+  private size: Float32Array;
+  private n: number;
+  private cursor = 0;
 
-  constructor(scene: THREE.Scene) {
-    this.pos = new Float32Array(this.max * 3).fill(-9999);
-    this.vel = new Float32Array(this.max * 3);
-    this.life = new Float32Array(this.max);
-    this.maxLife = new Float32Array(this.max);
-    this.baseCol = new Float32Array(this.max * 3);
-    this.col = new Float32Array(this.max * 3);
-    this.geo.setAttribute("position", new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage));
-    this.geo.setAttribute("color", new THREE.BufferAttribute(this.col, 3).setUsage(THREE.DynamicDrawUsage));
-    const mat = new THREE.PointsMaterial({
-      size: 0.5,
-      vertexColors: true,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      sizeAttenuation: true,
-    });
-    this.points = new THREE.Points(this.geo, mat);
+  constructor(scene: THREE.Scene, n = 700) {
+    this.n = n;
+    this.pos = new Float32Array(n * 3);
+    this.col = new Float32Array(n * 3);
+    this.vel = new Float32Array(n * 3);
+    this.life = new Float32Array(n);
+    this.maxLife = new Float32Array(n);
+    this.size = new Float32Array(n);
+    for (let i = 0; i < n; i++) this.pos[i * 3 + 1] = -9999;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setAttribute("color", new THREE.BufferAttribute(this.col, 3).setUsage(THREE.DynamicDrawUsage));
+    const mat = new THREE.PointsMaterial({ size: 0.42, vertexColors: true, transparent: true, opacity: 0.95, depthWrite: false });
+    this.points = new THREE.Points(geo, mat);
     this.points.frustumCulled = false;
     scene.add(this.points);
   }
 
-  burst(p: THREE.Vector3, count: number, colors: string[], speed: number, life = 0.7, up = 0) {
+  burst(p: THREE.Vector3, count: number, colors: string[], speed = 6, lifeS = 0.5, sizeMul = 2) {
     const c = new THREE.Color();
-    for (let i = 0; i < count; i++) {
-      const idx = this.cursor;
-      this.cursor = (this.cursor + 1) % this.max;
-      c.set(colors[Math.floor(Math.random() * colors.length)]);
-      this.baseCol[idx * 3] = c.r;
-      this.baseCol[idx * 3 + 1] = c.g;
-      this.baseCol[idx * 3 + 2] = c.b;
-      this.pos[idx * 3] = p.x;
-      this.pos[idx * 3 + 1] = p.y;
-      this.pos[idx * 3 + 2] = p.z;
+    for (let k = 0; k < count; k++) {
+      const i = this.cursor;
+      this.cursor = (this.cursor + 1) % this.n;
+      this.pos[i * 3] = p.x;
+      this.pos[i * 3 + 1] = p.y;
+      this.pos[i * 3 + 2] = p.z;
       const th = Math.random() * Math.PI * 2;
-      const ph = Math.acos(2 * Math.random() - 1);
-      const s = speed * (0.35 + Math.random() * 0.75);
-      this.vel[idx * 3] = Math.sin(ph) * Math.cos(th) * s;
-      this.vel[idx * 3 + 1] = Math.cos(ph) * s * 0.7 + up;
-      this.vel[idx * 3 + 2] = Math.sin(ph) * Math.sin(th) * s;
-      this.life[idx] = this.maxLife[idx] = life * (0.6 + Math.random() * 0.6);
+      const ph = Math.acos(Math.random() * 2 - 1);
+      const sp = speed * (0.4 + Math.random() * 0.8);
+      this.vel[i * 3] = Math.sin(ph) * Math.cos(th) * sp;
+      this.vel[i * 3 + 1] = Math.cos(ph) * sp * 0.8 + speed * 0.25;
+      this.vel[i * 3 + 2] = Math.sin(ph) * Math.sin(th) * sp;
+      c.set(colors[Math.floor(Math.random() * colors.length)]);
+      this.col[i * 3] = c.r;
+      this.col[i * 3 + 1] = c.g;
+      this.col[i * 3 + 2] = c.b;
+      this.life[i] = this.maxLife[i] = lifeS * (0.6 + Math.random() * 0.7);
+      this.size[i] = sizeMul;
     }
   }
 
   update(dt: number) {
-    for (let i = 0; i < this.max; i++) {
+    for (let i = 0; i < this.n; i++) {
       if (this.life[i] <= 0) continue;
       this.life[i] -= dt;
       if (this.life[i] <= 0) {
         this.pos[i * 3 + 1] = -9999;
-        this.col[i * 3] = this.col[i * 3 + 1] = this.col[i * 3 + 2] = 0;
         continue;
       }
-      this.vel[i * 3 + 1] -= 7 * dt;
+      this.vel[i * 3 + 1] -= 14 * dt;
       this.pos[i * 3] += this.vel[i * 3] * dt;
       this.pos[i * 3 + 1] += this.vel[i * 3 + 1] * dt;
       this.pos[i * 3 + 2] += this.vel[i * 3 + 2] * dt;
-      const f = this.life[i] / this.maxLife[i];
-      this.col[i * 3] = this.baseCol[i * 3] * f;
-      this.col[i * 3 + 1] = this.baseCol[i * 3 + 1] * f;
-      this.col[i * 3 + 2] = this.baseCol[i * 3 + 2] * f;
     }
-    (this.geo.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
-    (this.geo.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+    (this.points.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    (this.points.geometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
   }
 }
 
-/* ---------------- engine ---------------- */
+/* ================================================================ */
+
 export class Engine {
+  private canvas: HTMLCanvasElement;
+  private cbs: EngineCallbacks;
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
-  private city = new City();
+  private city: City;
   private sfx = new Sfx();
-  private cbs: EngineCallbacks;
-  private canvas: HTMLCanvasElement;
-
-  private raf = 0;
-  private last = 0;
-  private acc = 0;
-  private elapsed = 0;
-  private disposed = false;
+  private particles: Particles;
+  private crowd: Crowd;
+  private powerSpawner: PowerSpawner;
+  private market = new Market();
 
   phase: Phase = "menu";
-  private score = 0;
-  private combo = 0;
-  private maxCombo = 0;
-  private bestSwing = 0;
-  private time = RUN_TIME;
-  private collected = 0;
-  private lastTickSec = -1;
+  private mode: Mode = "free";
+  private disposed = false;
+  private raf = 0;
+  private last = performance.now();
+  private elapsed = 0;
+  private acc = 0;
 
-  // player physics
-  private pos = new THREE.Vector3();
+  // player
+  private playerRoot = new THREE.Group();
+  private player!: THREE.Group;
+  private rig!: Rig;
+  private pos = new THREE.Vector3(32, R + 0.1, 14);
   private vel = new THREE.Vector3();
-  private grounded = false;
-  private attached = false;
-  private anchor = new THREE.Vector3();
-  private anchorSky = false;
-  private ropeLen = 20;
-  private attachT = 0;
-  private cooldown = 0;
-  private swingFrom = new THREE.Vector3();
-  private touchGroundDuringSwing = false;
-
-  // camera / input
+  private grounded = true;
   private yaw = 0;
   private pitch = 0.22;
+  private locked = false;
+  private keys = new Set<string>();
+  private mouseWeb = false;
+  private glideHeld = false;
+  private slideHeld = false;
+  private braking = false;
+
+  // touch input (mobile)
+  private touchMove = { x: 0, y: 0 };
+  private touchWeb = false;
+  private touchGlide = false;
+  private touchSlide = false;
+
+  // swing
+  private attached = false;
+  private anchor = new THREE.Vector3();
+  private ropeLen = 10;
+  private attachT = 0;
+  private swingFrom = new THREE.Vector3();
+  private cooldown = 0;
+  private refireT = 0;
+  private touchGroundDuringSwing = false;
+  private bestSwing = 0;
+
+  // parkour
+  private jumpBufT = 0;
+  private jumpCut = false;
+  private coyoteT = 0;
+  private sliding = false;
+  private slideT = 0;
+  private slideCool = 0;
+  private gliding = false;
+  private dashCd = 0;
+  private dashT = 0;
+  private climbing = false;
+  private wallN = new THREE.Vector3();
+  private touchWallT = 0;
+  private touchWallN = new THREE.Vector3();
+
+  // animation
+  private gaitPhase = 0;
+  private climbPhase = 0;
+  private landSquashT = 0;
+  private jumpStretchT = 0;
+  private flinchT = 0;
+  private attackAnim = 0;
+  private hitFlash = 0;
+  private punchCooldown = 0;
+  private punchArmSide: "L" | "R" = "R";
+  private trickAnimT = 0;
+  private trickAnimType: "flip" | "spin" = "flip";
+  private trickCount = 0;
+  private trickAirTime = 0;
+
+  // camera
   private shake = 0;
   private fov = 72;
   private camLook = new THREE.Vector3();
@@ -269,215 +299,128 @@ export class Engine {
   private camRoll = 0;
   private fovPunch = 0;
 
-  // mode / net
-  private mode: Mode = "solo";
-  private countdown = 0;
-  private placement = 1;
-  private finalStandings: Standing[] = [];
-  private rosterCache: Standing[] = [];
-  private rosterAcc = 0;
-  private transport: RoomTransport | null = null;
-  private roomCode: string | null = null;
-  private pid = randomPid();
-  private netName = "SPIDER";
-  private netColor = "#52ffa8";
-  private ghosts = new Map<string, Ghost>();
-  private netAcc = 0;
-  private keys = new Set<string>();
-  private mouseWeb = false;
-  private braking = false;
-  private locked = false;
+  // comic post-processing (ink outlines + screentone)
+  private postScene = new THREE.Scene();
+  private postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private rt!: THREE.WebGLRenderTarget;
+  private postMat!: THREE.ShaderMaterial;
+  private slowmoMix = 0;
 
-  // ---- time-trial circuits ----
-  private circuitId: string | null = null;
-  private circuitRings: CircuitRing[] = [];
-  private circuitRingIdx = 0;
-  private circuitTime = 0;
-  private circuitLine: THREE.Line | null = null;
-  private circuitBeam: THREE.Mesh | null = null;
-
-  // ---- collection / inventory ----
-  wallet = 0;
-  owned = new Set<string>(["glove-starter", "suit-spider"]);
-  equippedGlove = "glove-starter";
-  equippedSuit = "suit-spider";
-  private webslingerFound = false;
-
-  // ---- story / mission progression ----
-  private missionIdx = 0;
-  private missionProg: Record<string, number> = {};
-  private missionDone = false;
-  private missionSwingBuf = 0;
-  private missionFlushT = 0;
-
-  // touch input (mobile) — held states + joystick; edge actions come through methods
-  touch = { joyX: 0, joyY: 0, web: false, glide: false, slide: false };
-  private coarse =
-    typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
-
-  touchJump() {
-    if (this.phase !== "playing" || this.countdown > 0) return;
-    this.jumpBufT = 0.14;
-  }
-  touchPunch() {
-    this.tryPunch();
-  }
-  touchDash() {
-    this.tryDash();
-  }
-  touchWebShot() {
-    this.tryWebShot();
-  }
-  touchWebRelease() {
-    if (this.attached) this.detach(true);
-  }
-  /** Drag-to-look for touch devices (bypasses pointer lock). */
-  lookDelta(dx: number, dy: number) {
-    if (this.phase !== "playing") return;
-    this.yaw -= dx * 0.0042;
-    this.pitch = THREE.MathUtils.clamp(this.pitch - dy * 0.0038, -1.05, 0.6);
-  }
-  private lockPointer() {
-    // pointer lock is desktop-only; touch devices drive the camera via lookDelta
-    if (!window.matchMedia("(pointer: fine)").matches) return;
-    try {
-      this.canvas.requestPointerLock();
-    } catch {
-      /* unsupported */
-    }
-  }
-
-  // parkour movement
-  private jumpBufT = 0;
-  private jumpCut = false;
-  private coyoteT = 0;
-  private slideHeld = false;
-  private sliding = false;
-  private slideT = 0;
-  private slideCool = 0;
-  private glideHeld = false;
-  private gliding = false;
-  private dashCd = 0;
-  private dashT = 0;
-  private refireT = 0;
-  private camSlide = 0;
-  private camGlide = 0;
-  private glider!: THREE.Group;
-  private gliderS = 0;
-
-  // tricks + slow-mo
-  private timeScale = 1;
-  private slowmoT = 0;
-  private trickCount = 0;
-  private trickAnimT = 0;
-  private trickAnimType: "flip" | "spin" = "flip";
-  private trickAirTime = 0;
-
-  // ---- player animation state ----
-  private playerRoot = new THREE.Group();
-  private gaitPhase = 0; // accumulated run cycle phase (distance-driven)
-  private climbPhase = 0; // accumulated climb cycle phase
-  private landSquashT = 0; // 1 → 0 landing squash
-  private jumpStretchT = 0; // 1 → 0 takeoff stretch
-  private flinchT = 0; // 1 → 0 hurt flinch
-  private jabT = 0; // 1 → 0 web-shot arm jab
-  private punchArmSide: "L" | "R" = "R"; // alternates jab / cross
-
-  // coins / heals / eggs
-  private coins = 0;
-  private eggsFound = new Set<string>();
-  private eggScanT = 0;
-
-  // swing damage into crowds
-  private swingHitCd = 0;
-
-  // wall climbing
-  private climbing = false;
-  private wallN = new THREE.Vector3(1, 0, 0);
-  private wallBox: Box | null = null;
-  private touchWallN = new THREE.Vector3();
-  private touchWallBox: Box | null = null;
-  private touchWallT = 0;
-
-  // web projectiles
-  private webShots: { p: THREE.Vector3; v: THREE.Vector3; life: number; mesh: THREE.Mesh; line: THREE.Line }[] = [];
-  private webShotCd = 0;
-  private webShotGeo = new THREE.SphereGeometry(0.24, 10, 8);
-
-  // scene objects
-  private player!: THREE.Group;
-  private rig!: Rig;
-  private blob!: THREE.Mesh;
-  private blobMat!: THREE.MeshBasicMaterial;
-  private webLine!: THREE.Line;
-  private webGlow!: THREE.Line;
-  private aimLine!: THREE.Line;
-  private particles: Particles;
-  private tokens: Token[] = [];
-  private glowTex: THREE.Texture;
-  private popupId = 0;
-  private trailAcc = 0;
-  private currentAnchor: { point: THREE.Vector3; sky: boolean } | null = null;
-
-  // backend (accounts / leaderboard)
-  private authUser: AccountUser | null = null;
-  private authUnsub: (() => void) | null = null;
-  private submitted = false;
-
-  // crowd + combat
-  private crowd!: Crowd;
+  // combat
   private punches: PunchEvent[] = [];
   private hp = 100;
   private invulnT = 0;
   private comboT = 0;
   private comboCount = 0;
-  private attackAnim = 0;
-  private hitFlash = 0;
-  private punchCooldown = 0;
+  private swingHitCd = 0;
   private ko = false;
   private thugsDown = 0;
+
+  // powers
+  private currentPower: PowerDef | null = null;
+  private powerCd: Record<string, number> = {};
+  private energy = 100;
+  private maxEnergy = 100;
+  private buddhaT = 0;
+  private buddhaS = 0;
+  private smokeT = 0;
+  private powerProjectiles: { mesh: THREE.Mesh; vel: THREE.Vector3; life: number; def: PowerDef; move: PowerMove }[] = [];
+  private pendingBlasts: { pos: THREE.Vector3; t: number; delay: number; def: PowerDef; move: PowerMove }[] = [];
+  private powerFx: { obj: THREE.Object3D; life: number; maxLife: number }[] = [];
+  private powerAura: THREE.Sprite | null = null;
+
+  // economy
+  private wallet = 0;
+  private upgrades: Record<string, number> = {};
+  private maxHp = 100;
+  private dmgMul = 1;
+  private swingBonus = 0;
+  private dashCdMul = 1;
+  private energyRegen = 14;
+
+  // run state
+  private score = 0;
+  private combo = 0;
+  private maxCombo = 0;
+  private time = RUN_TIME;
+  private collected = 0;
+  private countdown = 0;
+
+  // world objects
+  private tokens: { group: THREE.Group; baseY: number; phase: number; active: boolean; respawn: number }[] = [];
+  private glowTex: THREE.Texture;
+  private webLine!: THREE.Line;
+  private webGlow!: THREE.Line;
+  private aimLine!: THREE.Line;
+  private blob!: THREE.Mesh;
+  private blobMat!: THREE.MeshBasicMaterial;
+  private glider!: THREE.Group;
+  private gliderS = 0;
+  private webShots: { p: THREE.Vector3; v: THREE.Vector3; life: number; mesh: THREE.Mesh; line: THREE.Line }[] = [];
+  private webShotGeo = new THREE.SphereGeometry(0.22, 8, 8);
+  private webShotCd = 0;
+
+  // dealers
+  private dealerRigs: { rig: Rig; group: THREE.Group; idx: number }[] = [];
+  private nearDealerIdx = -1;
+  shopOpen = false;
+  private shopIdx = 0;
+
+  // easter eggs
+  private eggsFound = new Set<string>();
+  private eggScanT = 0;
+
+  private popupId = 0;
+  private trailAcc = 0;
+  private currentAnchor: { point: THREE.Vector3; sky: boolean } | null = null;
 
   private onKeyDown: (e: KeyboardEvent) => void;
   private onKeyUp: (e: KeyboardEvent) => void;
   private onMouseMove: (e: MouseEvent) => void;
   private onMouseDown: (e: MouseEvent) => void;
   private onMouseUp: (e: MouseEvent) => void;
+  private onCtx: (e: Event) => void;
   private onLockChange: () => void;
   private onResize: () => void;
-  private onCtx: (e: Event) => void;
-  private onVis: () => void;
-  private onCanvasClick: () => void;
 
   constructor(canvas: HTMLCanvasElement, cbs: EngineCallbacks) {
     this.canvas = canvas;
     this.cbs = cbs;
-    this.authUnsub = onAuthChange((u) => {
-      this.authUser = u;
-    });
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
+    this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
     this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.1, 2000);
-    this.scene.fog = new THREE.Fog(0x191743, 130, 720);
+    this.camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.1, 2400);
+    this.camera.position.set(32, 6, 30);
+    this.scene.fog = new THREE.FogExp2(0x0a0f2a, 0.0016);
 
-    const hemi = new THREE.HemisphereLight(0x8fb5ff, 0x2a1740, 1.0);
-    const dir = new THREE.DirectionalLight(0xffe2b0, 1.15);
-    dir.position.set(160, 260, -120);
-    this.scene.add(hemi, dir);
+    this.scene.add(new THREE.HemisphereLight(0x8fb4ff, 0x1a1430, 1.05));
+    const dir = new THREE.DirectionalLight(0xfff0d8, 1.15);
+    dir.position.set(120, 200, -80);
+    this.scene.add(dir);
+
+    this.city = new City();
     this.scene.add(this.city.group);
+    this.buildPost();
 
     this.glowTex = this.makeGlowTexture();
     this.particles = new Particles(this.scene);
+    this.crowd = new Crowd(this.scene, this.city);
+    this.powerSpawner = new PowerSpawner(this.scene, this.glowTex, 7);
+
     this.buildPlayer();
     this.buildWebLines();
     this.buildTokens();
-    this.crowd = new Crowd(this.scene, this.city);
-    this.loadStoryProgress();
+    this.buildDealers();
+    this.loadPersistence();
 
     this.onResize = () => {
-      this.renderer.setSize(window.innerWidth, window.innerHeight);
       this.camera.aspect = window.innerWidth / window.innerHeight;
       this.camera.updateProjectionMatrix();
+      this.renderer.setSize(window.innerWidth, window.innerHeight);
+      const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+      this.rt.setSize(size.x, size.y);
+      (this.postMat.uniforms.uRes.value as THREE.Vector2).set(size.x, size.y);
+      this.postMat.uniforms.uAspect.value = size.x / size.y;
     };
     this.onKeyDown = (e) => this.keyDown(e);
     this.onKeyUp = (e) => {
@@ -489,10 +432,10 @@ export class Engine {
     this.onMouseMove = (e) => {
       if (!this.locked || this.phase !== "playing") return;
       this.yaw -= e.movementX * 0.0023;
-      this.pitch = THREE.MathUtils.clamp(this.pitch - e.movementY * 0.0021, -1.05, 0.6);
+      this.pitch = THREE.MathUtils.clamp(this.pitch - e.movementY * 0.0021, -1.25, 1.35);
     };
     this.onMouseDown = (e) => {
-      if (this.phase !== "playing" || this.coarse) return;
+      if (this.phase !== "playing" || this.shopOpen) return;
       if (e.button === 0) {
         this.mouseWeb = true;
         this.refireT = 0;
@@ -503,22 +446,15 @@ export class Engine {
       } else if (e.button === 2) this.glideHeld = true;
     };
     this.onMouseUp = (e) => {
-      if (this.coarse) return;
       if (e.button === 0) {
         this.mouseWeb = false;
         if (this.attached) this.detach(true);
       } else if (e.button === 2) this.glideHeld = false;
     };
+    this.onCtx = (e) => e.preventDefault();
     this.onLockChange = () => {
       this.locked = document.pointerLockElement === this.canvas;
-      if (!this.locked && this.phase === "playing") this.pause();
-    };
-    this.onCtx = (e) => e.preventDefault();
-    this.onVis = () => {
-      if (document.hidden && this.phase === "playing") this.pause();
-    };
-    this.onCanvasClick = () => {
-      if (this.phase === "playing" && !this.locked) this.lockPointer();
+      if (!this.locked && this.phase === "playing" && !this.shopOpen) this.pause();
     };
 
     window.addEventListener("resize", this.onResize);
@@ -527,24 +463,49 @@ export class Engine {
     window.addEventListener("mousemove", this.onMouseMove);
     window.addEventListener("mousedown", this.onMouseDown);
     window.addEventListener("mouseup", this.onMouseUp);
+    this.canvas.addEventListener("contextmenu", this.onCtx);
     document.addEventListener("pointerlockchange", this.onLockChange);
-    document.addEventListener("visibilitychange", this.onVis);
-    canvas.addEventListener("contextmenu", this.onCtx);
-    canvas.addEventListener("click", this.onCanvasClick);
 
-    this.resetRun();
-    this.last = performance.now();
-    const loop = (now: number) => {
+    const loop = () => {
       if (this.disposed) return;
       this.raf = requestAnimationFrame(loop);
-      const dt = Math.min(0.05, (now - this.last) / 1000);
-      this.last = now;
-      this.frame(dt);
+      this.frame();
     };
-    this.raf = requestAnimationFrame(loop);
+    loop();
   }
 
   /* ---------------- setup ---------------- */
+  private buildPost() {
+    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    this.rt = new THREE.WebGLRenderTarget(size.x, size.y, { samples: 4 });
+    this.rt.depthTexture = new THREE.DepthTexture(size.x, size.y);
+    this.rt.depthTexture.type = THREE.UnsignedIntType;
+    this.postMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tColor: { value: this.rt.texture },
+        tDepth: { value: this.rt.depthTexture },
+        uRes: { value: new THREE.Vector2(size.x, size.y) },
+        uNear: { value: this.camera.near },
+        uFar: { value: this.camera.far },
+        uTime: { value: 0 },
+        uSpeed: { value: 0 },
+        uHit: { value: 0 },
+        uSlowmo: { value: 0 },
+        uAspect: { value: size.x / size.y },
+        uOutline: { value: 1.0 },
+        uScreen: { value: 0.46 },
+        uDotSize: { value: 3.4 },
+      },
+      vertexShader: POST_VERT,
+      fragmentShader: POST_FRAG,
+      depthWrite: false,
+      depthTest: false,
+    });
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.postMat);
+    quad.frustumCulled = false;
+    this.postScene.add(quad);
+  }
+
   private makeGlowTexture() {
     const cv = document.createElement("canvas");
     cv.width = cv.height = 64;
@@ -558,45 +519,29 @@ export class Engine {
     return new THREE.CanvasTexture(cv);
   }
 
-  private buildSpiderRig(): Rig {
-    return buildR6Rig(spiderStyle());
-  }
-
   private buildPlayer() {
-    this.rig = this.buildSpiderRig();
+    this.rig = buildR6Rig(spiderStyle());
     this.player = this.rig.group;
-    // outer root: world placement, facing yaw, squash & stretch, bob.
-    // inner rig group: trick rolls/spins so they never fight the facing yaw.
     this.playerRoot.add(this.player);
     this.scene.add(this.playerRoot);
 
-    // deployable web-chute (glide parachute)
+    this.powerAura = new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: this.glowTex, color: 0xffffff, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false })
+    );
+    this.powerAura.scale.setScalar(5);
+    this.powerAura.position.y = 0.2;
+    this.powerAura.visible = false;
+    this.playerRoot.add(this.powerAura);
+
+    // web-chute (glide)
     const glider = new THREE.Group();
     const canopyGeo = new THREE.ConeGeometry(1.75, 0.72, 12, 1, true);
-    const canopy = new THREE.Mesh(
-      canopyGeo,
-      new THREE.MeshBasicMaterial({
-        color: 0xaef3ff,
-        transparent: true,
-        opacity: 0.16,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      })
-    );
-    const ribs = new THREE.Mesh(
-      canopyGeo,
-      new THREE.MeshBasicMaterial({ color: 0x35e0ff, wireframe: true, transparent: true, opacity: 0.6, depthWrite: false })
-    );
-    const rim = new THREE.Mesh(
-      new THREE.TorusGeometry(1.75, 0.035, 6, 26),
-      new THREE.MeshBasicMaterial({ color: 0xf2fbff, transparent: true, opacity: 0.85 })
-    );
+    const canopy = new THREE.Mesh(canopyGeo, new THREE.MeshBasicMaterial({ color: 0xaef3ff, transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false }));
+    const ribs = new THREE.Mesh(canopyGeo, new THREE.MeshBasicMaterial({ color: 0x35e0ff, wireframe: true, transparent: true, opacity: 0.6, depthWrite: false }));
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(1.75, 0.035, 6, 26), new THREE.MeshBasicMaterial({ color: 0xf2fbff, transparent: true, opacity: 0.85 }));
     rim.rotation.x = Math.PI / 2;
     rim.position.y = -0.36;
-    const tip = new THREE.Mesh(
-      new THREE.SphereGeometry(0.09, 8, 8),
-      new THREE.MeshBasicMaterial({ color: 0xf2fbff })
-    );
+    const tip = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 8), new THREE.MeshBasicMaterial({ color: 0xf2fbff }));
     tip.position.y = 0.36;
     glider.add(canopy, ribs, rim, tip);
     glider.position.y = 2.6;
@@ -605,219 +550,11 @@ export class Engine {
     this.player.add(glider);
     this.glider = glider;
 
-    this.blobMat = new THREE.MeshBasicMaterial({ color: 0x02030c, transparent: true, opacity: 0.4, depthWrite: false });
-    this.blob = new THREE.Mesh(new THREE.CircleGeometry(0.85, 20), this.blobMat);
+    // blob shadow
+    this.blobMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.4, depthWrite: false });
+    this.blob = new THREE.Mesh(new THREE.CircleGeometry(0.8, 20), this.blobMat);
     this.blob.rotation.x = -Math.PI / 2;
     this.scene.add(this.blob);
-  }
-
-  /** Shared swing / glide / slide / fall / run posing for the player and ghost rigs. */
-  /**
-   * Full-body animator. Every pose is a set of joint targets; each joint lerps at
-   * its own responsiveness so strikes snap while idle breathing eases.
-   * Positive rotation.x on an arm swings it BACKWARD, negative swings it UP/FORWARD.
-   */
-  private applyPose(
-    r: Rig,
-    o: {
-      hs: number;
-      velY: number;
-      grounded: boolean;
-      attached: boolean;
-      k: number;
-      sliding?: boolean;
-      gliding?: boolean;
-      climbing?: boolean;
-      dashT?: number;
-      punchT?: number; // 0 → 1 across the whole punch
-      punchArm?: "L" | "R";
-      jabT?: number; // 0 → 1 web-shot jab
-      trickT?: number; // 0 → 1 flip/spin progress
-      flinchT?: number;
-      gait?: number; // distance-driven run phase
-      climb?: number; // climb cycle phase
-      pitch?: number; // camera pitch, for head aim
-    }
-  ) {
-    // joint targets
-    let aLx = 0.15, aRx = 0.15; // arm pitch (both sides)
-    let aLz = 0.12, aRz = -0.12; // arm splay
-    let lLx = 0, lRx = 0; // leg pitch
-    let lLz = 0.08, lRz = -0.08; // leg splay
-    let torsoX = 0, torsoY = 0; // lean forward+, twist
-    let headX = 0, headY = 0;
-    // per-joint responsiveness (higher = snappier)
-    let kArm = o.k, kLeg = o.k, kTorso = o.k, kHead = o.k;
-
-    const hs = o.hs;
-    const t = this.elapsed;
-
-    if (o.trickT !== undefined && o.trickT > 0) {
-      // ---- trick tuck: knees to chest, arms wrapped ----
-      lLx = -1.9; lRx = -1.9; lLz = 0.25; lRz = -0.25;
-      aLx = -1.15; aRx = -1.15; aLz = -0.85; aRz = 0.85; // crossed over chest
-      torsoX = 0.55;
-      kArm = kLeg = Math.min(1, o.k * 2.4);
-    } else if (o.climbing) {
-      // ---- wall climb: alternating reaches + steps, chest to the wall ----
-      const ph = o.climb ?? 0;
-      const s = Math.sin(ph);
-      aLx = -2.85 + s * 0.55;
-      aRx = -2.85 - s * 0.55;
-      aLz = 0.42; aRz = -0.42;
-      lLx = 1.05 - s * 0.5;
-      lRx = 1.05 + s * 0.5;
-      lLz = 0.45; lRz = -0.45;
-      torsoX = 0.18;
-      headX = -0.25; // looking up for the next hold
-    } else if (o.attached) {
-      // ---- swing: both hands gripping the web overhead, legs stream behind ----
-      const trail = Math.min(1, hs / 34);
-      aLx = -2.72 - 0.1; aRx = -2.72 + 0.1;
-      aLz = 0.08; aRz = -0.08;
-      lLx = 0.4 + trail * 0.55 + Math.sin(t * 9) * 0.1;
-      lRx = 0.4 + trail * 0.55 - Math.sin(t * 9) * 0.1;
-      lLz = 0.18; lRz = -0.18;
-      torsoX = -0.28; // arched back
-      headX = -0.5; // eyes on the anchor
-    } else if (o.gliding && !o.grounded) {
-      // ---- under the web-chute: hands up on the risers, legs dangle ----
-      aLx = -1.05; aRx = -1.05;
-      aLz = 1.45; aRz = -1.45;
-      lLx = 0.15 + Math.sin(t * 5) * 0.07;
-      lRx = 0.15 - Math.sin(t * 5) * 0.07;
-      lLz = 0.32; lRz = -0.32;
-      torsoX = -0.1;
-      headX = -0.15;
-    } else if (o.dashT && o.dashT > 0) {
-      // ---- dash: superman lean, arms swept back, legs together ----
-      aLx = 0.85; aRx = 0.85;
-      aLz = 0.2; aRz = -0.2;
-      lLx = 0.55; lRx = 0.45;
-      lLz = 0.05; lRz = -0.05;
-      torsoX = 0.85;
-      headX = -0.6; // chin up
-      kTorso = Math.min(1, o.k * 2.1);
-    } else if (o.sliding && o.grounded) {
-      // ---- slide: sit back, legs kicked forward and split, trail hand down ----
-      aLx = -0.55; aLz = 0.85; // balance arm up
-      aRx = 0.95; aRz = -0.3; // trail hand near the ground
-      lLx = 1.2; lRx = 1.05;
-      lLz = 0.42; lRz = -0.28;
-      torsoX = -0.5;
-      headX = -0.35;
-    } else if (!o.grounded) {
-      // ---- airborne: rising tuck vs falling spread ----
-      const rising = o.velY > 2;
-      const fall = o.velY < -6;
-      if (rising) {
-        aLx = -1.6; aRx = -1.6; aLz = 0.6; aRz = -0.6;
-        lLx = 0.95; lRx = 0.75; lLz = 0.22; lRz = -0.22;
-        torsoX = 0.12;
-      } else if (fall) {
-        aLx = -0.85; aRx = -0.85; aLz = 1.2; aRz = -1.2;
-        lLx = 0.35 + Math.sin(t * 7) * 0.08;
-        lRx = 0.35 - Math.sin(t * 7) * 0.08;
-        lLz = 0.3; lRz = -0.3;
-        torsoX = -0.15;
-      } else {
-        // apex hang — the classic spider pose
-        aLx = -1.5; aRx = -1.3; aLz = 0.75; aRz = -0.75;
-        lLx = 0.85; lRx = 0.6; lLz = 0.28; lRz = -0.28;
-      }
-      headX = o.velY < 0 ? 0.2 : -0.25;
-    } else if (hs > 2.5) {
-      // ---- run: distance-driven alternating gait + counter-rotation ----
-      const amp = Math.min(1, hs / 16);
-      const ph = o.gait ?? t * 11;
-      const sw = Math.sin(ph);
-      lLx = sw * 0.95 * amp;
-      lRx = -sw * 0.95 * amp;
-      aLx = -sw * 0.85 * amp; // arms oppose legs
-      aRx = sw * 0.85 * amp;
-      aLz = 0.14; aRz = -0.14;
-      lLz = 0.1; lRz = -0.1;
-      torsoX = 0.16 * amp + 0.1 * amp * Math.min(1, hs / 26); // lean into speed
-      torsoY = sw * 0.14 * amp; // shoulders counter-rotate the hips
-      headX = -0.06 * amp;
-    } else {
-      // ---- idle: breathing + subtle weight shift ----
-      const br = Math.sin(t * 2.1);
-      aLx = 0.15 + br * 0.03;
-      aRx = 0.15 - br * 0.03;
-      lLx = br * 0.02;
-      torsoY = Math.sin(t * 0.7) * 0.05;
-      headY = Math.sin(t * 0.5) * 0.1; // looking around
-    }
-
-    // ---- punch layer: windup → strike → recover, alternating jab/cross ----
-    if (o.punchT !== undefined && o.punchT > 0 && o.punchT < 1) {
-      const p = o.punchT;
-      const strike = o.punchArm === "L" ? "L" : "R";
-      // piecewise curve
-      let ext = 0; // 0 = rest, 1 = full extension
-      let wind = 0; // 0 = none, 1 = fully cocked back
-      if (p < 0.22) {
-        wind = p / 0.22;
-      } else if (p < 0.5) {
-        ext = (p - 0.22) / 0.28;
-      } else {
-        ext = 1 - (p - 0.5) / 0.5;
-      }
-      const ex = ext * ext * (3 - 2 * ext); // smoothstep the strike
-      const sX = -1.6 * ex + 0.55 * wind; // back, then snap forward
-      const gX = -0.95 - 0.15 * ex; // guard arm chambers
-      const twist = 0.6 * ex - 0.35 * wind;
-      if (strike === "R") {
-        aRx = sX; aRz = -0.1;
-        aLx = gX; aLz = 0.55;
-        torsoY = twist;
-      } else {
-        aLx = sX; aLz = 0.1;
-        aRx = gX; aRz = -0.55;
-        torsoY = -twist;
-      }
-      torsoX += 0.12 * ex;
-      kArm = Math.min(1, o.k * 3.2); // arms snap
-      kTorso = Math.min(1, o.k * 2.6);
-    }
-
-    // ---- web-shot jab layer (right hand snaps up briefly) ----
-    if (o.jabT && o.jabT > 0) {
-      const j = Math.sin(Math.min(1, o.jabT) * Math.PI);
-      aRx = -1.35 * j;
-      aRz = -0.15;
-      kArm = Math.min(1, o.k * 3);
-    }
-
-    // ---- flinch layer: recoil from a hit ----
-    if (o.flinchT && o.flinchT > 0) {
-      const f = o.flinchT;
-      torsoX += -0.45 * f;
-      headX += 0.5 * f;
-      aLx += -0.9 * f; aRx += -0.9 * f;
-      aLz += 0.3 * f; aRz += -0.3 * f;
-    }
-
-    // head tracks camera pitch on top of the pose
-    if (o.pitch !== undefined) {
-      headX += THREE.MathUtils.clamp(o.pitch * 0.55, -0.55, 0.45);
-    }
-
-    // ---- apply with per-joint smoothing ----
-    const mix = (cur: number, tgt: number, kk: number) => cur + (tgt - cur) * kk;
-    r.armL.rotation.x = mix(r.armL.rotation.x, aLx, kArm);
-    r.armR.rotation.x = mix(r.armR.rotation.x, aRx, kArm);
-    r.armL.rotation.z = mix(r.armL.rotation.z, aLz, kArm);
-    r.armR.rotation.z = mix(r.armR.rotation.z, aRz, kArm);
-    r.legL.rotation.x = mix(r.legL.rotation.x, lLx, kLeg);
-    r.legR.rotation.x = mix(r.legR.rotation.x, lRx, kLeg);
-    r.legL.rotation.z = mix(r.legL.rotation.z, lLz, kLeg);
-    r.legR.rotation.z = mix(r.legR.rotation.z, lRz, kLeg);
-    r.torso.rotation.x = mix(r.torso.rotation.x, torsoX, kTorso);
-    r.torso.rotation.y = mix(r.torso.rotation.y, torsoY, kTorso);
-    r.head.rotation.x = mix(r.head.rotation.x, headX, kHead);
-    r.head.rotation.y = mix(r.head.rotation.y, headY, kHead);
   }
 
   private buildWebLines() {
@@ -825,7 +562,7 @@ export class Engine {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3).setUsage(THREE.DynamicDrawUsage));
       const mat = dashed
-        ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, dashSize: 1.1, gapSize: 0.9 })
+        ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, dashSize: 1.1, gapSize: 0.8 })
         : new THREE.LineBasicMaterial({ color, transparent: true, opacity });
       const line = new THREE.Line(geo, mat);
       line.frustumCulled = false;
@@ -839,28 +576,125 @@ export class Engine {
   }
 
   private buildTokens() {
-    for (let i = 0; i < GOAL; i++) {
-      const group = new THREE.Group();
-      const ring = new THREE.Mesh(
-        new THREE.TorusGeometry(0.95, 0.13, 10, 26),
-        new THREE.MeshBasicMaterial({ color: 0xffcf3f })
-      );
-      const core = new THREE.Mesh(new THREE.OctahedronGeometry(0.52, 0), new THREE.MeshBasicMaterial({ color: 0xfff3b0 }));
-      const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.glowTex, color: 0xffcf3f, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
-      glow.scale.setScalar(4.4);
-      group.add(ring, core, glow);
-      const spot = this.city.tokenSpots[i];
-      group.position.copy(spot);
-      this.scene.add(group);
-      this.tokens.push({ group, baseY: spot.y, phase: Math.random() * 9, active: true, respawn: 0 });
+    for (const spot of this.city.tokenSpots) {
+      const g = new THREE.Group();
+      const core = new THREE.Mesh(new THREE.OctahedronGeometry(0.62, 0), new THREE.MeshBasicMaterial({ color: 0xffcf3f }));
+      const shell = new THREE.Mesh(new THREE.OctahedronGeometry(0.85, 0), new THREE.MeshBasicMaterial({ color: 0xffcf3f, wireframe: true, transparent: true, opacity: 0.5 }));
+      g.add(core, shell);
+      g.position.copy(spot);
+      this.scene.add(g);
+      this.tokens.push({ group: g, baseY: spot.y, phase: Math.random() * 7, active: true, respawn: 0 });
     }
   }
 
-  /* ---------------- public control ---------------- */
-  startRun(mode: Mode = "solo") {
-    this.mode = mode;
+  private buildDealers() {
+    for (let i = 0; i < DEALERS.length; i++) {
+      const d = DEALERS[i];
+      const spot = this.city.dealerSpots[i];
+      const g = new THREE.Group();
+
+      // counter
+      const counter = new THREE.Mesh(new THREE.BoxGeometry(4.2, 1.15, 1.5), new THREE.MeshLambertMaterial({ color: 0x3a2b20 }));
+      counter.position.y = 0.58;
+      g.add(counter);
+      const top = new THREE.Mesh(new THREE.BoxGeometry(4.5, 0.14, 1.8), new THREE.MeshLambertMaterial({ color: 0x5a4430 }));
+      top.position.y = 1.22;
+      g.add(top);
+
+      // crates of "merch"
+      const crateMat = new THREE.MeshLambertMaterial({ color: 0x2c3140 });
+      for (const cx of [-1.3, 0, 1.3]) {
+        const crate = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.55, 0.7), crateMat);
+        crate.position.set(cx, 1.55, 0);
+        g.add(crate);
+        const orb = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), new THREE.MeshBasicMaterial({ color: [0xff5c1f, 0x9ff0ff, 0x7a3cff][Math.floor(Math.random() * 3)] }));
+        orb.position.set(cx, 2.0, 0);
+        g.add(orb);
+      }
+
+      // posts + striped canopy
+      const postMat = new THREE.MeshLambertMaterial({ color: 0x252c4d });
+      for (const px of [-2.1, 2.1]) {
+        const post = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 3.4, 6), postMat);
+        post.position.set(px, 1.7, 0.7);
+        g.add(post);
+      }
+      const canopy = new THREE.Mesh(new THREE.BoxGeometry(5.2, 0.12, 2.6), new THREE.MeshLambertMaterial({ color: new THREE.Color(d.canopy).getHex() }));
+      canopy.position.set(0, 3.4, 0.2);
+      canopy.rotation.x = 0.14;
+      g.add(canopy);
+      const stripes = new THREE.Mesh(new THREE.BoxGeometry(5.2, 0.13, 2.6), new THREE.MeshLambertMaterial({ color: 0xf2f2f2 }));
+      stripes.position.set(0, 3.36, 0.2);
+      stripes.rotation.x = 0.14;
+      stripes.scale.set(0.98, 1, 0.5);
+      g.add(stripes);
+
+      // neon sign
+      const sign = makeTextSprite(`${d.name}'S DEALS`, d.canopy, 26, 4);
+      sign.position.set(0, 4.6, 0.4);
+      g.add(sign);
+
+      // ground glow
+      const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.glowTex, color: new THREE.Color(d.canopy).getHex(), transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, depthWrite: false }));
+      glow.scale.setScalar(9);
+      glow.position.y = 0.3;
+      g.add(glow);
+
+      g.position.set(spot.x, 0, spot.z);
+      g.rotation.y = Math.atan2(this.city.spawn.x - spot.x, this.city.spawn.z - spot.z);
+      this.scene.add(g);
+
+      // the dealer themself, behind the counter
+      const style: RigStyle = {
+        head: d.palette.head,
+        torso: d.palette.torso,
+        arms: d.palette.arms,
+        legs: d.palette.legs,
+        headTex: null,
+        cap: d.palette.cap,
+      };
+      const rig = buildR6Rig(style);
+      rig.group.position.set(spot.x - Math.sin(g.rotation.y) * 1.5, 0, spot.z - Math.cos(g.rotation.y) * 1.5);
+      rig.group.rotation.y = g.rotation.y + Math.PI;
+      this.scene.add(rig.group);
+      this.dealerRigs.push({ rig, group: rig.group, idx: i });
+    }
+  }
+
+  private loadPersistence() {
+    this.wallet = loadCash();
+    this.upgrades = loadUpgrades();
+    this.applyUpgrades();
+    void syncCash(this.wallet).then((w) => {
+      this.wallet = w;
+    });
+    void syncUpgrades(this.upgrades).then((u) => {
+      this.upgrades = u;
+      this.applyUpgrades();
+    });
+  }
+
+  private applyUpgrades() {
+    const lv = (id: string) => this.upgrades[id] ?? 0;
+    this.maxHp = 100 + lv("vitality") * 25;
+    this.maxEnergy = 100 + lv("surge") * 25;
+    this.energyRegen = 14 * (1 + 0.2 * lv("flow"));
+    this.dmgMul = 1 + 0.12 * lv("might");
+    this.swingBonus = lv("aero") * 1.5;
+    this.dashCdMul = Math.pow(0.88, lv("blink"));
+    this.hp = Math.min(this.hp || this.maxHp, this.maxHp);
+    if (this.hp <= 0) this.hp = this.maxHp;
+  }
+
+  /* ---------------- state machine ---------------- */
+  private setPhase(p: Phase) {
+    this.phase = p;
+    this.cbs.onPhase(p, p === "won" || p === "lost" ? this.stats() : null);
+  }
+
+  startRun(mode: Mode) {
     this.sfx.ensure();
-    this.sfx.startWind();
+    this.mode = mode;
     this.resetRun();
     this.setPhase("playing");
     this.lockPointer();
@@ -871,158 +705,46 @@ export class Engine {
     this.startRun(this.mode);
   }
 
-  resume() {
-    if (this.phase !== "paused") return;
-    this.sfx.ensure();
-    this.setPhase("playing");
-    this.canvas.requestPointerLock();
-    this.sfx.ui();
-  }
-
-  pause() {
-    if (this.phase !== "playing") return;
-    this.keys.clear();
-    this.mouseWeb = false;
-    this.glideHeld = false;
-    this.slideHeld = false;
-    this.touch.joyX = 0;
-    this.touch.joyY = 0;
-    this.touch.web = false;
-    this.touch.glide = false;
-    this.touch.slide = false;
-    this.setPhase("paused");
-    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
-  }
-
-  toMenu() {
-    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
-    this.leaveRoom();
-    this.maybeSubmitScore();
-    this.resetRun();
-    this.playerRoot.visible = false;
-    this.setPhase("menu");
-  }
-
-  toggleMute() {
-    this.sfx.setMuted(!this.sfx.muted);
-  }
-
-  dispose() {
-    this.disposed = true;
-    if (this.transport) {
-      this.transport.close();
-      this.transport = null;
-    }
-    this.authUnsub?.();
-    this.authUnsub = null;
-    this.clearWebShots();
-    if (this.crowd) this.crowd.dispose();
-    cancelAnimationFrame(this.raf);
-    window.removeEventListener("resize", this.onResize);
-    window.removeEventListener("keydown", this.onKeyDown);
-    window.removeEventListener("keyup", this.onKeyUp);
-    window.removeEventListener("mousemove", this.onMouseMove);
-    window.removeEventListener("mousedown", this.onMouseDown);
-    window.removeEventListener("mouseup", this.onMouseUp);
-    document.removeEventListener("pointerlockchange", this.onLockChange);
-    document.removeEventListener("visibilitychange", this.onVis);
-    this.canvas.removeEventListener("contextmenu", this.onCtx);
-    this.canvas.removeEventListener("click", this.onCanvasClick);
-    this.renderer.dispose();
-  }
-
-  /* ---------------- run state ---------------- */
-  private setPhase(p: Phase) {
-    this.phase = p;
-    this.cbs.onPhase(p, p === "won" || p === "lost" ? this.stats() : null);
-  }
-
-  private stats(): RunStats {
-    return {
-      score: this.score,
-      tokens: this.collected,
-      maxCombo: this.maxCombo,
-      bestSwing: Math.round(this.bestSwing),
-      timeLeft: this.mode === "free" ? 0 : Math.max(0, Math.ceil(this.time)),
-      mode: this.mode,
-      placement: this.placement,
-      standings: this.finalStandings,
-      ko: this.ko,
-      thugsDown: this.thugsDown,
-    };
-  }
-
-  /** Upload the finished run to the websling leaderboard (once per run). */
-  private maybeSubmitScore() {
-    if (this.submitted || !BACKEND_READY || !this.authUser || this.score <= 0) return;
-    this.submitted = true;
-    const s = this.stats();
-    submitScore(this.authUser.id, {
-      mode: s.mode,
-      score: s.score,
-      tokens: s.tokens,
-      maxCombo: s.maxCombo,
-      bestSwing: s.bestSwing,
-      timeLeft: s.timeLeft,
-      placement: s.mode === "versus" && s.placement > 0 ? s.placement : null,
-    })
-      .then(() => this.cbs.onToast?.("SCORE SAVED TO LEADERBOARD"))
-      .catch(() => this.cbs.onToast?.("LEADERBOARD UPLOAD FAILED"));
-  }
-
   private resetRun() {
     this.score = 0;
-    this.submitted = false;
     this.combo = 0;
     this.maxCombo = 0;
     this.bestSwing = 0;
-    this.hp = 100;
+    this.collected = 0;
+    this.time = RUN_TIME;
+    this.countdown = 3.0;
     this.ko = false;
     this.thugsDown = 0;
-    this.invulnT = 0;
+    this.hp = this.maxHp;
+    this.energy = this.maxEnergy;
+    this.powerCd = {};
+    this.buddhaT = 0;
+    this.buddhaS = 0;
+    this.smokeT = 0;
+    this.clearPowerProjectiles();
+    this.pendingBlasts.length = 0;
+    this.pos.copy(this.city.spawn).setY(R + 0.1);
+    this.vel.set(0, 0, 0);
+    this.attached = false;
+    this.grounded = true;
+    this.sliding = false;
+    this.gliding = false;
+    this.climbing = false;
+    this.dashCd = 0;
+    this.dashT = 0;
     this.comboCount = 0;
     this.comboT = 0;
+    this.trickCount = 0;
+    this.trickAnimT = 0;
+    this.gaitPhase = 0;
+    this.climbPhase = 0;
+    this.landSquashT = 0;
+    this.jumpStretchT = 0;
+    this.flinchT = 0;
     this.attackAnim = 0;
     this.hitFlash = 0;
     this.punchCooldown = 0;
     this.punches.length = 0;
-    this.climbing = false;
-    this.wallBox = null;
-    this.touchWallT = 0;
-    this.webShotCd = 0;
-    this.clearWebShots();
-    if (this.crowd) this.crowd.reset();
-    this.time = RUN_TIME;
-    this.collected = 0;
-    this.lastTickSec = -1;
-    this.pos.copy(this.city.spawn).setY(R);
-    this.vel.set(0, 0, 0);
-    this.grounded = true;
-    this.attached = false;
-    this.cooldown = 0;
-    this.yaw = 0;
-    this.pitch = 0.22;
-    this.shake = 0;
-    this.fov = 72;
-    this.camDist = 9;
-    this.camRoll = 0;
-    this.fovPunch = 0;
-    this.countdown = 3.0;
-    this.placement = 1;
-    this.finalStandings = [];
-    this.jumpBufT = 0;
-    this.jumpCut = false;
-    this.coyoteT = 0;
-    this.slideHeld = false;
-    this.sliding = false;
-    this.slideT = 0;
-    this.slideCool = 0;
-    this.glideHeld = false;
-    this.gliding = false;
-    this.dashCd = 0;
-    this.dashT = 0;
-    this.camSlide = 0;
-    this.camGlide = 0;
     this.gliderS = 0;
     if (this.glider) this.glider.visible = false;
     this.playerRoot.scale.set(1, 1, 1);
@@ -1031,45 +753,146 @@ export class Engine {
       this.rig.torso.rotation.set(0, 0, 0);
       this.rig.head.rotation.set(0, 0, 0);
     }
-    this.gaitPhase = 0;
-    this.climbPhase = 0;
-    this.landSquashT = 0;
-    this.jumpStretchT = 0;
-    this.flinchT = 0;
-    this.jabT = 0;
-    this.trickAnimT = 0;
-    this.trickCount = 0;
     this.keys.clear();
     this.mouseWeb = false;
-    // in versus, jitter spawns so rivals don't all drop on the same manhole
-    if (this.mode === "versus") {
-      let h = 0;
-      for (const ch of this.pid) h = (h * 31 + ch.charCodeAt(0)) | 0;
-      this.pos.x += ((h % 7) - 3) * 2.1;
-      this.pos.z += (((h >> 3) % 7) - 3) * 2.1;
-    }
+    this.glideHeld = false;
+    this.slideHeld = false;
+    this.yaw = 0;
+    this.pitch = 0.22;
+    this.camDist = 9;
+    this.camRoll = 0;
+    this.fovPunch = 0;
     this.camLook.set(this.pos.x, this.pos.y + 1.6, this.pos.z);
     this.camera.position.set(this.pos.x, this.pos.y + 1.4, this.pos.z + 9);
     this.camera.fov = 72;
     this.camera.updateProjectionMatrix();
-    this.playerRoot.visible = this.phase !== "menu";
+    this.playerRoot.visible = true;
     this.webLine.visible = false;
     this.webGlow.visible = false;
     this.aimLine.visible = false;
-    this.blob.visible = false;
     this.tokens.forEach((t, i) => {
       t.active = true;
       t.respawn = 0;
       t.group.visible = true;
       t.group.position.copy(this.city.tokenSpots[i]);
-      t.baseY = this.city.tokenSpots[i].y;
     });
+    this.crowd.reset();
+    this.powerSpawner.reset();
+    this.shopOpen = false;
+    this.cbs.onShop(null);
   }
 
+  pause() {
+    if (this.phase !== "playing") return;
+    this.keys.clear();
+    this.mouseWeb = false;
+    this.glideHeld = false;
+    this.slideHeld = false;
+    this.setPhase("paused");
+    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+  }
+
+  resume() {
+    if (this.phase !== "paused") return;
+    this.setPhase("playing");
+    this.lockPointer();
+  }
+
+  toMenu() {
+    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+    this.resetRun();
+    this.playerRoot.visible = false;
+    this.setPhase("menu");
+  }
+
+  toggleMute() {
+    this.sfx.ensure();
+    this.sfx.setMuted(!this.sfx.muted);
+  }
+
+  /* ---------------- touch input (mobile) ---------------- */
+  touchLook(dx: number, dy: number) {
+    this.yaw -= dx * 0.0044;
+    this.pitch = THREE.MathUtils.clamp(this.pitch - dy * 0.004, -1.25, 1.35);
+  }
+  setTouchMove(x: number, y: number) {
+    const m = Math.hypot(x, y);
+    const s = m > 1 ? 1 / m : 1;
+    this.touchMove.x = x * s;
+    this.touchMove.y = y * s;
+  }
+  setTouchWeb(on: boolean) {
+    const was = this.touchWeb;
+    this.touchWeb = on;
+    if (on) this.tryWeb();
+    else if (was && this.attached) this.detach(true);
+  }
+  setTouchGlide(on: boolean) {
+    this.touchGlide = on;
+  }
+  setTouchSlide(on: boolean) {
+    this.touchSlide = on;
+  }
+  touchJump() {
+    if (this.phase !== "playing") return;
+    this.jumpBufT = 0.14;
+    if (!this.grounded && this.coyoteT <= 0 && !this.attached && !this.gliding && !this.climbing) this.tryTrick("flip");
+  }
+  touchDash() {
+    this.tryDash();
+  }
+  touchPunch() {
+    this.tryPunch();
+  }
+
+  private lockPointer() {
+    if (!window.matchMedia("(pointer: fine)").matches) return;
+    try {
+      this.canvas.requestPointerLock();
+    } catch {
+      /* unsupported */
+    }
+  }
+
+  private stats(): RunStats {
+    return {
+      score: this.score,
+      tokens: this.collected,
+      maxCombo: this.maxCombo,
+      bestSwing: Math.round(this.bestSwing),
+      timeLeft: Math.max(0, Math.ceil(this.time)),
+      mode: this.mode,
+      ko: this.ko,
+      thugsDown: this.thugsDown,
+    };
+  }
+
+  private endRun(goalReached: boolean) {
+    const won = this.mode === "solo" ? goalReached : false;
+    if (won) this.sfx.win();
+    else this.sfx.lose();
+    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+    this.setPhase(won ? "won" : "lost");
+  }
+
+  /* ---------------- input ---------------- */
   private keyDown(e: KeyboardEvent) {
     if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
     if (e.ctrlKey && (e.code === "KeyC" || e.code === "KeyW" || e.code === "KeyR") && this.phase === "playing") e.preventDefault();
     this.keys.add(e.code);
+
+    if (e.code === "KeyM" && !e.repeat) this.toggleMute();
+
+    if (this.phase === "menu" && (e.code === "Enter" || e.code === "Space") && !e.repeat) {
+      this.startRun("free");
+      return;
+    }
+
+    if (this.shopOpen) {
+      if ((e.code === "KeyT" || e.code === "Escape") && !e.repeat) this.closeShop();
+      return;
+    }
+
     if (this.phase === "playing") {
       if (e.code === "Space" && !e.repeat) {
         this.jumpBufT = 0.14;
@@ -1078,58 +901,57 @@ export class Engine {
       if ((e.code === "ShiftLeft" || e.code === "ShiftRight") && !e.repeat) {
         if (!this.grounded && !this.attached && !this.gliding && !this.climbing) this.tryTrick("spin");
       }
-      if ((e.code === "KeyQ") && !e.repeat) {
+      if (e.code === "KeyQ" && !e.repeat) {
         if (this.attached) this.detach(true);
         else this.tryWeb();
       }
-      if (e.code === "ControlLeft" || e.code === "ControlRight" || e.code === "KeyC") {
+      if (e.code === "ControlLeft" || e.code === "ControlRight" || (e.code === "KeyC" && !this.currentPower)) {
         this.slideHeld = true;
-        if (!e.repeat) this.trySlide();
       }
       if (e.code === "KeyF" && !e.repeat) this.tryDash();
       if (e.code === "KeyE") this.glideHeld = true;
-      if ((e.code === "KeyV" || e.code === "KeyB") && !e.repeat) this.tryPunch();
-      if (e.code === "KeyX" && !e.repeat) this.tryWebShot();
+      if (e.code === "KeyT" && !e.repeat && this.nearDealerIdx >= 0) this.openShop(this.nearDealerIdx);
+
+      if (this.currentPower) {
+        if (e.code === "KeyZ" && !e.repeat) this.castPower(0);
+        if (e.code === "KeyX" && !e.repeat) this.castPower(1);
+        if (e.code === "KeyC" && !e.repeat) this.castPower(2);
+        if (e.code === "KeyV" && !e.repeat) this.castPower(3);
+        if (e.code === "KeyB" && !e.repeat) this.tryPunch();
+      } else {
+        if ((e.code === "KeyV" || e.code === "KeyB") && !e.repeat) this.tryPunch();
+      }
     }
-    if (e.code === "KeyM" && !e.repeat) this.toggleMute();
-    if (e.code === "KeyR" && this.phase === "playing" && !e.repeat) {
-      this.pos.copy(this.city.spawn).setY(R + 0.1);
-      this.vel.set(0, 0, 0);
-      this.attached = false;
-      this.camLook.set(this.pos.x, this.pos.y + 1.6, this.pos.z);
-      this.camera.position.set(this.pos.x, this.pos.y + 1.4, this.pos.z + 9);
-      this.camRoll = 0;
-      this.popupAt(this.pos, "RESET", "cyan");
-    }
+
     if (e.code === "KeyP" && !e.repeat) {
       if (this.phase === "playing") this.pause();
       else if (this.phase === "paused") this.resume();
     }
+    if (e.code === "KeyR" && this.phase === "playing" && !e.repeat) {
+      this.pos.copy(this.city.spawn).setY(R + 0.1);
+      this.vel.set(0, 0, 0);
+      this.attached = false;
+      this.climbing = false;
+      this.camera.position.set(this.pos.x, this.pos.y + 1.4, this.pos.z + 9);
+      this.camLook.set(this.pos.x, this.pos.y + 1.6, this.pos.z);
+    }
   }
 
-  /* ---------------- web mechanics ---------------- */
-  private aimDir(out: THREE.Vector3) {
+  /* ---------------- web ---------------- */
+  private aimDir(out: THREE.Vector3): THREE.Vector3 {
     const cp = Math.cos(this.pitch);
-    out.set(-Math.sin(this.yaw) * cp, Math.sin(this.pitch), -Math.cos(this.yaw) * cp);
-    return out;
+    return out.set(-Math.sin(this.yaw) * cp, Math.sin(this.pitch), -Math.cos(this.yaw) * cp);
   }
 
   private tryWeb() {
     if (this.phase !== "playing" || this.countdown > 0 || this.attached || this.cooldown > 0) return;
-    if (this.grounded) {
-      this.vel.y = Math.max(this.vel.y, 13.5);
-      this.grounded = false;
-      this.sfx.jump();
-    }
     const dir = this.aimDir(new THREE.Vector3());
     const hit = this.city.findAnchor(this.pos, dir);
     this.anchor.copy(hit.point);
-    this.anchorSky = hit.sky;
     const d = this.pos.distanceTo(this.anchor);
     this.ropeLen = THREE.MathUtils.clamp(d * 0.97, 7, 58);
     this.attached = true;
     if (this.climbing) {
-      // launching off the wall into a swing
       this.climbing = false;
       this.vel.addScaledVector(this.wallN, 4);
     }
@@ -1137,61 +959,106 @@ export class Engine {
     this.touchGroundDuringSwing = false;
     this.swingFrom.copy(this.pos);
     this.cooldown = 0.1;
-    this.fovPunch = -4.5;
-    this.shake = Math.min(1.4, this.shake + 0.22);
+    this.fovPunch = Math.max(this.fovPunch, 2.5);
     this.sfx.thwip();
-    this.particles.burst(this.anchor, hit.sky ? 6 : 12, ["#aef3ff", "#35e0ff", "#ffffff"], hit.sky ? 3 : 7, 0.45);
-    this.popupAt(this.pos.clone().add(new THREE.Vector3(0, 1.4, 0)), "THWIP!", "cyan");
+    this.particles.burst(hit.point, 8, ["#f2fbff", "#aef3ff"], 4, 0.35, 1.6);
   }
 
   private detach(byUser: boolean) {
     if (!this.attached) return;
     this.attached = false;
-    this.cooldown = 0.14;
-    const swung = this.attachT > 0.32 && !this.touchGroundDuringSwing;
+    this.cooldown = 0.12;
+    const swingDist = this.pos.distanceTo(this.swingFrom);
+    if (swingDist > this.bestSwing) this.bestSwing = swingDist;
+    if (swingDist > 18) {
+      const bonus = Math.round(swingDist * 3) * Math.max(1, this.combo);
+      this.score += bonus;
+      this.popupAt(_v.set(this.pos.x, this.pos.y + 1.6, this.pos.z), `BIG SWING +${bonus}`, "gold");
+    }
     if (byUser) {
       const fwd = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
       this.vel.addScaledVector(fwd, 1.6);
       this.vel.y += 1.1;
       this.fovPunch = Math.max(this.fovPunch, 2.5);
     }
-    if (swung) {
-      const flat = Math.hypot(this.pos.x - this.swingFrom.x, this.pos.z - this.swingFrom.z);
-      if (flat > this.bestSwing) this.bestSwing = flat;
-      this.combo = Math.min(5, this.combo + 1);
-      this.maxCombo = Math.max(this.maxCombo, this.combo);
-      if (this.combo >= 2) this.popupAt(this.pos, `COMBO x${this.combo}`, "red");
-      if (flat > 42) {
-        this.score += 150;
-        this.popupAt(this.pos.clone().add(new THREE.Vector3(0, 1.6, 0)), "BIG SWING +150", "gold");
-        this.sfx.bigSwing();
+    this.sfx.release();
+  }
+
+  private tryWebShot() {
+    if (this.phase !== "playing" || this.countdown > 0 || this.webShotCd > 0) return;
+    this.webShotCd = 0.22;
+    const dir = this.aimDir(new THREE.Vector3());
+    const origin = new THREE.Vector3().copy(this.pos);
+    origin.y += 0.9;
+    origin.addScaledVector(dir, 0.9);
+    const mesh = new THREE.Mesh(this.webShotGeo, new THREE.MeshBasicMaterial({ color: 0xf6fcff }));
+    mesh.position.copy(origin);
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3).setUsage(THREE.DynamicDrawUsage));
+    const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xf2fbff, transparent: true, opacity: 0.9 }));
+    line.frustumCulled = false;
+    this.scene.add(mesh, line);
+    this.webShots.push({ p: origin, v: dir.multiplyScalar(48).addScaledVector(this.vel, 0.35), life: 1.05, mesh, line });
+    this.sfx.webShot();
+    this.attackAnim = 1;
+    this.punchArmSide = "R";
+    this.particles.burst(origin, 6, ["#f2fbff", "#aef3ff"], 3, 0.3, 1.4);
+  }
+
+  private updateWebShots(dt: number) {
+    const hand = _v.copy(this.pos);
+    hand.y += 0.9;
+    for (let i = this.webShots.length - 1; i >= 0; i--) {
+      const s = this.webShots[i];
+      s.life -= dt;
+      s.v.y -= 7 * dt;
+      s.p.addScaledVector(s.v, dt);
+      let done = false;
+      let hit = false;
+      if (this.crowd.webAt(s.p.x, s.p.y, s.p.z)) {
+        done = true;
+        hit = true;
+      } else if (s.p.y < 0.15) done = true;
+      else {
+        for (const b of this.city.boxes) {
+          if (s.p.x > b.cx - b.hx && s.p.x < b.cx + b.hx && s.p.z > b.cz - b.hz && s.p.z < b.cz + b.hz && s.p.y > (b.y0 ?? 0) && s.p.y < b.top) {
+            done = true;
+            break;
+          }
+        }
       }
-      this.sfx.snap();
-    }
-    this.particles.burst(this.pos, 6, ["#35e0ff", "#aef3ff"], 5, 0.4);
-  }
-
-  private trySlide() {
-    if (this.phase !== "playing" || this.countdown > 0) return;
-    if (this.grounded && !this.sliding && this.slideCool <= 0 && Math.hypot(this.vel.x, this.vel.z) > 8) {
-      this.sliding = true;
-      this.slideT = 0;
-      const hs = Math.hypot(this.vel.x, this.vel.z);
-      const boost = 1 + Math.min(0.35, 4 / Math.max(hs, 1));
-      this.vel.x *= boost;
-      this.vel.z *= boost;
-      this.sfx.slide();
-      this.particles.burst(
-        _v.set(this.pos.x, this.pos.y - R + 0.15, this.pos.z),
-        12,
-        ["#8a93b8", "#aab3d4", "#5b6488"],
-        5,
-        0.5,
-        2
-      );
+      if (done || s.life <= 0) {
+        if (hit) {
+          this.sfx.webImpact();
+          this.particles.burst(s.p, 16, ["#f2fbff", "#ffffff", "#aef3ff"], 6, 0.5, 2);
+          this.popupAt(s.p.clone(), "WEBBED", "cyan");
+        }
+        this.scene.remove(s.mesh, s.line);
+        (s.mesh.material as THREE.Material).dispose();
+        (s.line.material as THREE.Material).dispose();
+        s.line.geometry.dispose();
+        this.webShots.splice(i, 1);
+        continue;
+      }
+      s.mesh.position.copy(s.p);
+      const arr = s.line.geometry.attributes.position as THREE.BufferAttribute;
+      arr.setXYZ(0, hand.x, hand.y, hand.z);
+      arr.setXYZ(1, s.p.x, s.p.y, s.p.z);
+      arr.needsUpdate = true;
     }
   }
 
+  private clearWebShots() {
+    for (const s of this.webShots) {
+      this.scene.remove(s.mesh, s.line);
+      (s.mesh.material as THREE.Material).dispose();
+      (s.line.material as THREE.Material).dispose();
+      s.line.geometry.dispose();
+    }
+    this.webShots.length = 0;
+  }
+
+  /* ---------------- parkour actions ---------------- */
   private tryDash() {
     if (this.phase !== "playing" || this.countdown > 0 || this.dashCd > 0) return;
     const fwdH = _f.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
@@ -1207,7 +1074,7 @@ export class Engine {
     this.vel.z = dir.z * 34;
     if (this.grounded) this.vel.y = Math.max(this.vel.y, 2.4);
     this.sliding = false;
-    this.dashCd = 0.9;
+    this.dashCd = 0.9 * this.dashCdMul;
     this.dashT = 0.18;
     this.fovPunch = Math.max(this.fovPunch, 4.5);
     this.shake = Math.min(1, this.shake + 0.18);
@@ -1216,27 +1083,54 @@ export class Engine {
     this.popupAt(_v.set(this.pos.x, this.pos.y + 1.2, this.pos.z), "DASH!", "cyan");
   }
 
+  private tryTrick(type: "flip" | "spin") {
+    if (this.trickAnimT > 0 || this.countdown > 0) return;
+    this.trickAnimType = type;
+    this.trickAnimT = 0.5;
+    this.trickCount++;
+    const pts = 120 * this.trickCount;
+    this.score += pts;
+    this.sfx.flip();
+    this.particles.burst(this.pos, 10, type === "flip" ? ["#aef3ff", "#ffffff"] : ["#ff4fd8", "#ffffff"], 6, 0.45, 2);
+    this.popupAt(_v.set(this.pos.x, this.pos.y + 1.6, this.pos.z), `${type === "flip" ? "FLIP" : "SPIN"} +${pts}`, "cyan");
+    if (this.trickCount === 3 && this.slowmoT <= 0) {
+      this.slowmoT = 1.25;
+      this.sfx.slowmo();
+      this.popupAt(_v.set(this.pos.x, this.pos.y + 2.6, this.pos.z), "SLOW-MO STYLE!", "gold");
+    }
+  }
+
+  private slowmoT = 0;
+  private timeScale = 1;
+
+  private landTricks() {
+    if (this.trickCount > 0) {
+      if (this.trickCount >= 2) {
+        const bank = 200 * this.trickCount;
+        this.score += bank;
+        this.popupAt(_v.set(this.pos.x, this.pos.y + 1.8, this.pos.z), `TRICK COMBO x${this.trickCount} +${bank}`, "gold");
+      }
+      this.trickCount = 0;
+    }
+    this.trickAnimT = 0;
+    this.player.rotation.set(0, 0, 0);
+    this.trickAirTime = 0;
+  }
+
   /* ---------------- combat ---------------- */
   private tryPunch() {
     if (this.phase !== "playing" || this.countdown > 0 || this.punchCooldown > 0) return;
     this.punchCooldown = 0.34;
     this.attackAnim = 1;
-    // alternate jab / cross for a real combo feel
     this.punchArmSide = this.punchArmSide === "R" ? "L" : "R";
     const dir = this.aimDir(new THREE.Vector3());
     const heavy = !this.grounded;
-    const dmg = heavy ? 55 : 32;
+    const dmg = (heavy ? 55 : 32) * this.dmgMul * (this.buddhaT > 0 ? 1.5 : 1);
     this.sfx.punchWhiff();
     this.punches.push({
-      x: this.pos.x,
-      y: this.pos.y + 0.3,
-      z: this.pos.z,
-      dx: dir.x,
-      dy: dir.y,
-      dz: dir.z,
-      dmg,
-      range: heavy ? 4.2 : 3.4,
-      heavy,
+      x: this.pos.x, y: this.pos.y + 0.3, z: this.pos.z,
+      dx: dir.x, dy: dir.y, dz: dir.z,
+      dmg, range: heavy ? 4.2 : 3.4, heavy,
     });
   }
 
@@ -1253,46 +1147,23 @@ export class Engine {
     if (this.comboCount === 3) this.popupAt(_v.set(at.x, at.y + 1.2, at.z), "COMBO!", "gold");
   }
 
-  private tryTrick(type: "flip" | "spin") {
-    if (this.trickAnimT > 0 || this.countdown > 0) return;
-    this.trickAnimType = type;
-    this.trickAnimT = 0.5;
-    this.trickCount++;
-    const pts = 120 * this.trickCount;
-    this.score += pts;
-    this.sfx.flip();
-    this.particles.burst(this.pos, 10, type === "flip" ? ["#aef3ff", "#ffffff"] : ["#ff4fd8", "#ffffff"], 6, 0.45, 2);
-    this.popupAt(_v.set(this.pos.x, this.pos.y + 1.6, this.pos.z), `${type === "flip" ? "FLIP" : "SPIN"} +${pts}`, "cyan");
-    // chaining 3+ tricks in one airtime triggers slow-mo so you can admire it
-    if (this.trickCount === 3 && this.slowmoT <= 0) {
-      this.slowmoT = 1.25;
-      this.sfx.slowmo();
-      this.popupAt(_v.set(this.pos.x, this.pos.y + 2.6, this.pos.z), "SLOW-MO STYLE!", "gold");
-    }
-  }
-
-  private landTricks() {
-    if (this.trickCount > 0) {
-      if (this.trickCount >= 2) {
-        const bank = 200 * this.trickCount;
-        this.score += bank;
-        this.popupAt(_v.set(this.pos.x, this.pos.y + 1.8, this.pos.z), `TRICK COMBO x${this.trickCount} +${bank}`, "gold");
-      }
-      this.trickCount = 0;
-    }
-    this.trickAnimT = 0;
-    this.rig.group.rotation.set(0, 0, 0);
-    this.trickAirTime = 0;
-  }
-
   private onThugKilled(at: THREE.Vector3) {
     const bounty = 250 * Math.max(1, this.combo);
     this.score += bounty;
     this.thugsDown++;
-    this.missionInc("thugs", 1);
+    const cashDrop = 40 + Math.floor(Math.random() * 50);
+    this.addCash(cashDrop);
     this.popupAt(at, `+${bounty} BOUNTY`, "gold");
+    this.popupAt(_v.set(at.x, at.y + 0.4, at.z), `+$${cashDrop}`, "cash");
     this.particles.burst(at, 26, ["#ffcf3f", "#ffffff", "#ff2438"], 11, 1, 3);
-    this.hp = Math.min(100, this.hp + 6);
+    this.hp = Math.min(this.maxHp, this.hp + 6);
+  }
+
+  private onSwingHit(points: number, at: THREE.Vector3) {
+    this.score += points * 2;
+    this.swingHitCd = 0.4;
+    this.shake = Math.min(1.2, this.shake + 0.3);
+    this.popupAt(at, `SLAM +${points * 2}`, "cyan");
   }
 
   private damagePlayer(n: number, from: THREE.Vector3) {
@@ -1312,10 +1183,11 @@ export class Engine {
     this.particles.burst(this.pos, 14, ["#ff2438", "#ffffff"], 8, 0.5, 2.6);
     if (this.hp <= 0) {
       if (this.mode === "free") {
-        this.hp = 100;
+        this.hp = this.maxHp;
         this.pos.copy(this.city.spawn).setY(R + 0.1);
         this.vel.set(0, 0, 0);
         this.attached = false;
+        this.climbing = false;
         this.popupAt(_v.set(this.pos.x, this.pos.y + 2, this.pos.z), "RESPAWN", "cyan");
       } else {
         this.ko = true;
@@ -1324,466 +1196,353 @@ export class Engine {
     }
   }
 
-  /* ---------------- wall climbing ---------------- */
-  private handleClimb(h: number) {
-    const b = this.wallBox;
-    if (!b) {
-      this.climbing = false;
-      return;
-    }
-    // wall-jump: kick off away from the face
-    if (this.jumpBufT > 0) {
-      this.jumpBufT = 0;
-      this.climbing = false;
-      this.vel.set(this.wallN.x * 13, 15.5, this.wallN.z * 13);
-      this.grounded = false;
-      this.sfx.jump();
-      this.particles.burst(this.pos, 12, ["#aef3ff", "#ffffff"], 6, 0.5, 2);
-      return;
-    }
-    let vy = 0;
-    if (this.keys.has("KeyW")) vy += 7.2;
-    if (this.keys.has("KeyS")) vy -= 6.2;
-    const tang = _t.set(-this.wallN.z, 0, this.wallN.x);
-    let st = 0;
-    if (this.keys.has("KeyD")) st += 1;
-    if (this.keys.has("KeyA")) st -= 1;
-    // touch: joystick up climbs / down descends, sideways shimmies along the face
-    vy += -this.touch.joyY * 7.2;
-    const jwx = Math.sin(this.yaw) * this.touch.joyY + Math.cos(this.yaw) * this.touch.joyX;
-    const jwz = Math.cos(this.yaw) * this.touch.joyY - Math.sin(this.yaw) * this.touch.joyX;
-    st += jwx * tang.x + jwz * tang.z;
-    const vt = st * 5.2;
-
-    this.pos.addScaledVector(tang, vt * h);
-    this.pos.y += vy * h;
-
-    // stay glued to the wall surface
-    if (Math.abs(this.wallN.x) > 0.5) this.pos.x = b.cx + this.wallN.x * (b.hx + R);
-    else this.pos.z = b.cz + this.wallN.z * (b.hz + R);
-    if (Math.abs(this.wallN.x) > 0.5) this.pos.z = THREE.MathUtils.clamp(this.pos.z, b.cz - b.hz - R, b.cz + b.hz + R);
-    else this.pos.x = THREE.MathUtils.clamp(this.pos.x, b.cx - b.hx - R, b.cx + b.hx + R);
-
-    // mantle over the ledge
-    if (this.pos.y > b.top + R * 0.35) {
-      this.pos.y = b.top + R;
-      this.climbing = false;
-      this.grounded = true;
-      this.vel.set(0, 2.5, 0);
-      this.sfx.jump();
-      this.particles.burst(this.pos, 8, ["#aef3ff", "#ffffff"], 3.5, 0.4, 1.6);
-      return;
-    }
-    if (this.pos.y <= R) {
-      this.pos.y = R;
-      this.climbing = false;
-      this.grounded = true;
-      this.vel.set(0, 0, 0);
-      return;
-    }
-    this.vel.set(tang.x * vt, vy, tang.z * vt);
-    this.grounded = false;
-    this.coyoteT = 0.12;
+  /* ---------------- powers ---------------- */
+  private tintColors(def: PowerDef): string[] {
+    const hex = (n: number) => `#${n.toString(16).padStart(6, "0")}`;
+    return [hex(def.glow), hex(def.color), "#ffffff"];
   }
 
-  /* ---------------- web projectiles ---------------- */
-  private tryWebShot() {
-    if (this.phase !== "playing" || this.countdown > 0 || this.webShotCd > 0) return;
-    this.webShotCd = 0.22;
-    this.jabT = 1; // arm snaps up
+  private moveCost(m: PowerMove): number {
+    if (m.arch === "buff") return 35;
+    if (m.arch === "leap") return 12;
+    if (m.arch === "jump") return 10;
+    return Math.max(8, Math.round(m.dmg * 0.3));
+  }
+
+  castPower(idx: number) {
+    const f = this.currentPower;
+    if (!f || this.phase !== "playing" || this.countdown > 0 || this.shopOpen) return;
+    const mv = f.moves[idx];
+    if (!mv) return;
+    if ((this.powerCd[mv.key] ?? 0) > 0) {
+      this.sfx.fizzle();
+      return;
+    }
+    const cost = this.moveCost(mv);
+    if (this.energy < cost) {
+      this.sfx.fizzle();
+      this.popupAt(_v.set(this.pos.x, this.pos.y + 1.6, this.pos.z), "LOW ENERGY", "red");
+      return;
+    }
+    this.energy -= cost;
+    this.powerCd[mv.key] = mv.cd;
+    this.executePower(mv, f);
+  }
+
+  private emitAoe(pos: THREE.Vector3, radius: number, dmg: number, mv: PowerMove, f: PowerDef) {
+    this.punches.push({
+      x: pos.x, y: pos.y, z: pos.z,
+      dx: 0, dy: 0, dz: 0,
+      dmg: dmg * this.dmgMul, range: radius, heavy: true,
+      aoe: true, freeze: mv.freeze, pull: mv.pull,
+      kbForce: mv.pull ? 6 : 11,
+      tint: this.tintColors(f),
+    });
+  }
+
+  private executePower(mv: PowerMove, f: PowerDef) {
     const dir = this.aimDir(new THREE.Vector3());
-    const origin = new THREE.Vector3().copy(this.pos);
-    origin.y += 1.25; // from the hand, not the feet
-    origin.addScaledVector(dir, 0.8);
-    const mesh = new THREE.Mesh(this.webShotGeo, new THREE.MeshBasicMaterial({ color: 0xf6fcff }));
-    mesh.position.copy(origin);
-    const lineGeo = new THREE.BufferGeometry();
-    lineGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3).setUsage(THREE.DynamicDrawUsage));
-    const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xf2fbff, transparent: true, opacity: 0.9 }));
-    line.frustumCulled = false;
-    this.scene.add(mesh, line);
-    this.webShots.push({ p: origin, v: dir.multiplyScalar(48).addScaledVector(this.vel, 0.35), life: 1.05, mesh, line });
-    this.sfx.webShot();
-    this.particles.burst(origin, 6, ["#f2fbff", "#aef3ff"], 3, 0.3, 1.4);
-  }
+    const tint = this.tintColors(f);
+    const at = _v.set(this.pos.x, this.pos.y + 0.4, this.pos.z);
+    this.attackAnim = 1;
 
-  private clearWebShots() {
-    for (const s of this.webShots) {
-      this.scene.remove(s.mesh, s.line);
-      (s.mesh.material as THREE.Material).dispose();
-      (s.line.material as THREE.Material).dispose();
-      s.line.geometry.dispose();
+    switch (mv.arch) {
+      case "burst":
+        this.sfx.powerCast();
+        this.shake = Math.min(1.2, this.shake + 0.3);
+        this.fovPunch = Math.max(this.fovPunch, 2);
+        this.particles.burst(at, 26, tint, 9, 0.5, 2.6);
+        this.emitAoe(at, mv.radius, mv.dmg, mv, f);
+        break;
+      case "beam": {
+        this.sfx.powerBeam();
+        this.fovPunch = Math.max(this.fovPunch, 3);
+        const end = at.clone().addScaledVector(dir, 44);
+        this.spawnBeamFx(at, end, f);
+        this.particles.burst(end, 14, tint, 6, 0.4, 2);
+        this.punches.push({
+          x: at.x, y: at.y, z: at.z, dx: dir.x, dy: dir.y, dz: dir.z,
+          dmg: mv.dmg * this.dmgMul, range: 46, heavy: true,
+          freeze: mv.freeze, pull: mv.pull, tint,
+        });
+        break;
+      }
+      case "dash":
+        this.sfx.powerDash();
+        this.vel.x = dir.x * 34;
+        this.vel.z = dir.z * 34;
+        if (this.grounded) this.vel.y = Math.max(this.vel.y, 3);
+        this.fovPunch = Math.max(this.fovPunch, 4.5);
+        this.particles.burst(at, 20, tint, 8, 0.5, 2.4);
+        this.punches.push({
+          x: at.x + dir.x * 3, y: at.y, z: at.z + dir.z * 3,
+          dx: dir.x, dy: 0, dz: dir.z,
+          dmg: mv.dmg * this.dmgMul, range: 10, heavy: true,
+          freeze: mv.freeze, tint,
+        });
+        break;
+      case "projectile":
+        this.sfx.powerCast();
+        this.spawnPowerProjectile(mv, f, dir);
+        break;
+      case "blast":
+        this.sfx.powerCast();
+        this.pendingBlasts.push({ pos: at.clone(), t: 0, delay: 0.42, def: f, move: mv });
+        this.spawnRingFx(at, mv.radius, f);
+        break;
+      case "leap":
+        this.sfx.powerDash();
+        this.vel.y = 21;
+        this.vel.x += dir.x * 17;
+        this.vel.z += dir.z * 17;
+        this.jumpStretchT = 1;
+        this.particles.burst(at, 14, tint, 6, 0.4, 2);
+        break;
+      case "jump":
+        this.sfx.jump();
+        this.vel.y = 16.5;
+        this.grounded = false;
+        this.jumpStretchT = 1;
+        this.particles.burst(at, 10, tint, 5, 0.35, 1.8);
+        break;
+      case "buff":
+        if (f.id === "colossus") {
+          this.buddhaT = mv.buffT ?? 8;
+          this.sfx.powerBlast();
+          this.popupAt(_v.set(this.pos.x, this.pos.y + 2.4, this.pos.z), "COLOSSUS FORM", "gold");
+          this.shake = Math.min(1.4, this.shake + 0.5);
+          this.particles.burst(at, 40, ["#ffd700", "#fff3b0", "#ffffff"], 10, 0.8, 3);
+        } else {
+          this.smokeT = mv.buffT ?? 3;
+          this.invulnT = Math.max(this.invulnT, mv.buffT ?? 3);
+          this.sfx.powerCast();
+          this.popupAt(_v.set(this.pos.x, this.pos.y + 2.2, this.pos.z), "SMOKE SCREEN", "cyan");
+          this.particles.burst(at, 36, ["#9aa3c0", "#dfe5f5", "#6a739a"], 7, 0.9, 3.4);
+        }
+        break;
     }
-    this.webShots.length = 0;
   }
 
-  private updateWebShots(dt: number) {
-    const hand = _v.copy(this.pos);
-    hand.y += 0.9;
-    for (let i = this.webShots.length - 1; i >= 0; i--) {
-      const s = this.webShots[i];
+  private spawnPowerProjectile(mv: PowerMove, f: PowerDef, dir: THREE.Vector3) {
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.4, 12, 10), new THREE.MeshBasicMaterial({ color: f.glow }));
+    const origin = new THREE.Vector3().copy(this.pos);
+    origin.y += 0.6;
+    origin.addScaledVector(dir, 1);
+    mesh.position.copy(origin);
+    this.scene.add(mesh);
+    this.powerProjectiles.push({ mesh, vel: dir.clone().multiplyScalar(52).addScaledVector(this.vel, 0.3), life: 1.3, def: f, move: mv });
+  }
+
+  private spawnBeamFx(from: THREE.Vector3, to: THREE.Vector3, f: PowerDef) {
+    const len = from.distanceTo(to);
+    const mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.14, 0.14, len, 8, 1, true),
+      new THREE.MeshBasicMaterial({ color: f.glow, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false })
+    );
+    mesh.position.copy(from.clone().lerp(to, 0.5));
+    mesh.lookAt(to);
+    mesh.rotateX(Math.PI / 2);
+    this.scene.add(mesh);
+    this.powerFx.push({ obj: mesh, life: 0.16, maxLife: 0.16 });
+  }
+
+  private spawnRingFx(at: THREE.Vector3, radius: number, f: PowerDef) {
+    const mesh = new THREE.Mesh(
+      new THREE.RingGeometry(radius * 0.85, radius, 40),
+      new THREE.MeshBasicMaterial({ color: f.glow, transparent: true, opacity: 0.75, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false })
+    );
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.position.set(at.x, 0.3, at.z);
+    this.scene.add(mesh);
+    this.powerFx.push({ obj: mesh, life: 0.42, maxLife: 0.42 });
+  }
+
+  private equipPower(def: PowerDef, source: "wild" | "dealer") {
+    const swapped = this.currentPower && this.currentPower.id !== def.id;
+    this.currentPower = def;
+    this.energy = this.maxEnergy;
+    this.powerCd = {};
+    this.sfx.powerEat();
+    this.shake = Math.min(1, this.shake + 0.25);
+    this.particles.burst(_v.set(this.pos.x, this.pos.y + 1, this.pos.z), 44, this.tintColors(def), 11, 0.9, 3);
+    const label = swapped ? `SWAPPED → ${def.name.toUpperCase()}` : source === "dealer" ? `${def.name.toUpperCase()} PURCHASED!` : `${def.name.toUpperCase()} EQUIPPED!`;
+    this.popupAt(_v.set(this.pos.x, this.pos.y + 2.4, this.pos.z), label, "gold");
+    if (this.powerAura) {
+      (this.powerAura.material as THREE.SpriteMaterial).color.setHex(def.glow);
+      this.powerAura.visible = true;
+    }
+  }
+
+  private clearPowerProjectiles() {
+    for (const s of this.powerProjectiles) {
+      this.scene.remove(s.mesh);
+      (s.mesh.material as THREE.Material).dispose();
+      s.mesh.geometry.dispose();
+    }
+    this.powerProjectiles.length = 0;
+  }
+
+  private updatePowers(dt: number) {
+    this.powerSpawner.update(dt, this.elapsed);
+    if (this.phase === "playing" && this.countdown <= 0 && !this.shopOpen) {
+      const def = this.powerSpawner.tryTake(this.pos, 2.6);
+      if (def) this.equipPower(def, "wild");
+    }
+    this.energy = Math.min(this.maxEnergy, this.energy + this.energyRegen * dt);
+    for (const k of Object.keys(this.powerCd)) this.powerCd[k] = Math.max(0, this.powerCd[k] - dt);
+    this.buddhaT = Math.max(0, this.buddhaT - dt);
+    this.smokeT = Math.max(0, this.smokeT - dt);
+
+    for (let i = this.powerProjectiles.length - 1; i >= 0; i--) {
+      const s = this.powerProjectiles[i];
       s.life -= dt;
-      s.v.y -= 7 * dt;
-      s.p.addScaledVector(s.v, dt);
-      let done = false;
-      let hit = false;
-      if (this.crowd.webAt(s.p.x, s.p.y, s.p.z)) {
-        done = true;
-        hit = true;
-      } else if (s.p.y < 0.15) {
-        done = true;
-      } else {
+      s.vel.y -= 6 * dt;
+      s.mesh.position.addScaledVector(s.vel, dt);
+      const mp = s.mesh.position;
+      let boom = s.life <= 0 || mp.y < 0.2;
+      if (!boom) {
         for (const b of this.city.boxes) {
-          if (
-            s.p.x > b.cx - b.hx &&
-            s.p.x < b.cx + b.hx &&
-            s.p.z > b.cz - b.hz &&
-            s.p.z < b.cz + b.hz &&
-            s.p.y > 0 &&
-            s.p.y < b.top
-          ) {
-            done = true;
+          if (mp.x > b.cx - b.hx && mp.x < b.cx + b.hx && mp.z > b.cz - b.hz && mp.z < b.cz + b.hz && mp.y > (b.y0 ?? 0) && mp.y < b.top) {
+            boom = true;
             break;
           }
         }
       }
-      if (done || s.life <= 0) {
-        if (hit) {
-          this.sfx.webImpact();
-          this.particles.burst(s.p, 16, ["#f2fbff", "#ffffff", "#aef3ff"], 6, 0.5, 2);
-          this.popupAt(s.p.clone(), "WEBBED", "cyan");
-        } else {
-          this.particles.burst(s.p, 5, ["#f2fbff"], 2.5, 0.3, 1.2);
-        }
-        this.scene.remove(s.mesh, s.line);
+      if (boom) {
+        this.sfx.powerBlast();
+        this.shake = Math.min(1.2, this.shake + 0.28);
+        this.particles.burst(mp, 22, this.tintColors(s.def), 8, 0.5, 2.4);
+        this.emitAoe(mp, s.move.radius, s.move.dmg, s.move, s.def);
+        this.scene.remove(s.mesh);
         (s.mesh.material as THREE.Material).dispose();
-        (s.line.material as THREE.Material).dispose();
-        s.line.geometry.dispose();
-        this.webShots.splice(i, 1);
-        continue;
+        s.mesh.geometry.dispose();
+        this.powerProjectiles.splice(i, 1);
       }
-      s.mesh.position.copy(s.p);
-      const arr = s.line.geometry.attributes.position as THREE.BufferAttribute;
-      arr.setXYZ(0, hand.x, hand.y, hand.z);
-      arr.setXYZ(1, s.p.x, s.p.y, s.p.z);
-      arr.needsUpdate = true;
+    }
+
+    for (let i = this.pendingBlasts.length - 1; i >= 0; i--) {
+      const b = this.pendingBlasts[i];
+      b.t += dt;
+      if (b.t >= b.delay) {
+        this.sfx.powerBlast();
+        this.shake = Math.min(1.5, this.shake + 0.5);
+        this.fovPunch = Math.max(this.fovPunch, 5);
+        this.particles.burst(b.pos, 46, this.tintColors(b.def), 13, 0.8, 3.2);
+        this.emitAoe(b.pos, b.move.radius, b.move.dmg, b.move, b.def);
+        this.pendingBlasts.splice(i, 1);
+      }
+    }
+
+    for (let i = this.powerFx.length - 1; i >= 0; i--) {
+      const fx = this.powerFx[i];
+      fx.life -= dt;
+      const mtl = (fx.obj as THREE.Mesh).material as THREE.MeshBasicMaterial;
+      mtl.opacity = Math.max(0, (fx.life / fx.maxLife) * 0.9);
+      if (fx.life <= 0) {
+        this.scene.remove(fx.obj);
+        mtl.dispose();
+        (fx.obj as THREE.Mesh).geometry.dispose();
+        this.powerFx.splice(i, 1);
+      }
     }
   }
 
-  /* ---------------- time-trial circuits ---------------- */
-  startCircuit(id: string) {
-    const c = CIRCUITS.find((x) => x.id === id);
-    if (!c) return;
-    this.clearCircuit();
-    this.circuitId = id;
-    this.mode = "circuit";
-    // path line
-    const pts = c.pts.map(([x, y, z]) => new THREE.Vector3(x, y, z));
-    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
-    this.circuitLine = new THREE.Line(
-      lineGeo,
-      new THREE.LineDashedMaterial({ color: c.color, dashSize: 2, gapSize: 1.4, transparent: true, opacity: 0.5 })
-    );
-    this.circuitLine.computeLineDistances();
-    this.scene.add(this.circuitLine);
-    // rings
-    for (let i = 0; i < pts.length; i++) {
-      const mesh = new THREE.Mesh(
-        new THREE.TorusGeometry(4, 0.3, 10, 30),
-        new THREE.MeshBasicMaterial({ color: c.color, transparent: true, opacity: 0.35 })
-      );
-      mesh.position.copy(pts[i]);
-      if (i + 1 < pts.length) mesh.lookAt(pts[i + 1]);
-      const glow = new THREE.Sprite(
-        new THREE.SpriteMaterial({ map: this.glowTex, color: c.color, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.5 })
-      );
-      glow.scale.setScalar(9);
-      glow.position.copy(pts[i]);
-      this.scene.add(mesh, glow);
-      this.circuitRings.push({ mesh, glow, pos: pts[i].clone(), hit: false });
-    }
-    // beam on the active ring
-    this.circuitBeam = new THREE.Mesh(
-      new THREE.CylinderGeometry(4.4, 4.4, 90, 16, 1, true),
-      new THREE.MeshBasicMaterial({ color: c.color, transparent: true, opacity: 0.1, side: THREE.DoubleSide, depthWrite: false })
-    );
-    this.scene.add(this.circuitBeam);
-    this.startRun("circuit");
+  /* ---------------- dealers / shop ---------------- */
+  private openShop(idx: number) {
+    if (this.phase !== "playing") return;
+    this.shopOpen = true;
+    this.shopIdx = idx;
+    this.sfx.ui();
+    // free the cursor so the shop overlay is clickable
+    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+    this.refreshShop();
   }
 
-  private clearCircuit() {
-    for (const r of this.circuitRings) {
-      this.scene.remove(r.mesh, r.glow);
-      r.mesh.geometry.dispose();
-      (r.mesh.material as THREE.Material).dispose();
-      (r.glow.material as THREE.Material).dispose();
-    }
-    this.circuitRings = [];
-    if (this.circuitLine) {
-      this.scene.remove(this.circuitLine);
-      this.circuitLine.geometry.dispose();
-      (this.circuitLine.material as THREE.Material).dispose();
-      this.circuitLine = null;
-    }
-    if (this.circuitBeam) {
-      this.scene.remove(this.circuitBeam);
-      this.circuitBeam.geometry.dispose();
-      (this.circuitBeam.material as THREE.Material).dispose();
-      this.circuitBeam = null;
-    }
-    this.circuitId = null;
-    this.circuitRingIdx = 0;
-    this.circuitTime = 0;
+  closeShop() {
+    if (!this.shopOpen) return;
+    this.shopOpen = false;
+    this.sfx.ui();
+    this.cbs.onShop(null);
+    this.lockPointer();
   }
 
-  private circuitActive(): boolean {
-    return this.mode === "circuit" && this.circuitId !== null && this.countdown <= 0;
+  private refreshShop() {
+    this.cbs.onShop(this.market.snapshot(this.shopIdx, this.wallet, this.upgrades));
   }
 
-  private updateCircuit(dt: number) {
-    if (!this.circuitActive() || this.circuitRingIdx >= this.circuitRings.length) return;
-    this.circuitTime += dt;
-    const ring = this.circuitRings[this.circuitRingIdx];
-    // orient beam at current ring + pulse the active ring
-    if (this.circuitBeam) {
-      this.circuitBeam.position.set(ring.pos.x, ring.pos.y, ring.pos.z);
-      this.circuitBeam.rotation.y += dt * 1.4;
+  buy(kind: "power" | "heal" | "soda" | "upgrade", slot: number) {
+    if (!this.shopOpen) return;
+    const snap = this.market.snapshot(this.shopIdx, this.wallet, this.upgrades);
+    const spend = (n: number) => {
+      this.wallet -= n;
+      saveCash(this.wallet);
+    };
+    if (kind === "power") {
+      const listing = snap.powers[slot];
+      if (!listing || listing.sold) return;
+      if (this.wallet < listing.price) {
+        this.sfx.denied();
+        this.cbs.onToast("NOT ENOUGH CASH");
+        return;
+      }
+      this.market.takePower(this.shopIdx, slot);
+      spend(listing.price);
+      const def = POWERS_BY_ID.get(listing.powerId);
+      if (def) this.equipPower(def, "dealer");
+      this.sfx.buy();
+    } else if (kind === "heal") {
+      if (this.wallet < HEAL_PRICE) {
+        this.sfx.denied();
+        this.cbs.onToast("NOT ENOUGH CASH");
+        return;
+      }
+      spend(HEAL_PRICE);
+      this.hp = Math.min(this.maxHp, this.hp + HEAL_AMOUNT);
+      this.sfx.buy();
+      this.popupAt(_v.set(this.pos.x, this.pos.y + 1.6, this.pos.z), `+${HEAL_AMOUNT} HP`, "cash");
+    } else if (kind === "soda") {
+      if (this.wallet < SODA_PRICE) {
+        this.sfx.denied();
+        this.cbs.onToast("NOT ENOUGH CASH");
+        return;
+      }
+      spend(SODA_PRICE);
+      this.energy = this.maxEnergy;
+      this.sfx.buy();
+      this.popupAt(_v.set(this.pos.x, this.pos.y + 1.6, this.pos.z), "FULL ENERGY", "cyan");
+    } else if (kind === "upgrade") {
+      const u = snap.upgrades[slot];
+      if (!u || u.maxed) return;
+      if (this.wallet < u.price) {
+        this.sfx.denied();
+        this.cbs.onToast("NOT ENOUGH CASH");
+        return;
+      }
+      spend(u.price);
+      this.upgrades[u.def.id] = (this.upgrades[u.def.id] ?? 0) + 1;
+      saveUpgrades(this.upgrades);
+      this.applyUpgrades();
+      this.hp = this.maxHp;
+      this.sfx.buy();
+      this.popupAt(_v.set(this.pos.x, this.pos.y + 1.6, this.pos.z), `${u.def.name} LV${this.upgrades[u.def.id]}`, "gold");
     }
-    const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 6);
-    (ring.mesh.material as THREE.MeshBasicMaterial).opacity = 0.5 + pulse * 0.5;
-    ring.mesh.rotation.z += dt * 1.2;
-    // pass detection
-    if (this.pos.distanceTo(ring.pos) < 7) {
-      ring.hit = true;
-      (ring.mesh.material as THREE.MeshBasicMaterial).opacity = 0.15;
-      (ring.glow.material as THREE.SpriteMaterial).opacity = 0.12;
-      this.circuitRingIdx++;
-      this.sfx.collect(1);
-      this.popupAt(ring.pos.clone().add(new THREE.Vector3(0, 5, 0)), `RING ${this.circuitRingIdx}/${this.circuitRings.length}`, "cyan");
-      this.particles.burst(ring.pos, 22, ["#ffffff", "#35e0ff"], 8, 0.6, 2.6);
-      if (this.circuitRingIdx >= this.circuitRings.length) this.finishCircuit();
-    }
+    this.refreshShop();
   }
 
-  private finishCircuit() {
-    const c = CIRCUITS.find((x) => x.id === this.circuitId);
-    if (!c) return;
-    const ms = Math.round(this.circuitTime * 1000);
-    const beatTarget = this.circuitTime <= c.target;
-    if (beatTarget) this.missionInc("circuit", 1, c.id);
-    const prevBest = Number(localStorage.getItem(`websling-tt-${c.id}`) ?? 0);
-    const isPb = prevBest === 0 || ms < prevBest;
-    if (isPb) localStorage.setItem(`websling-tt-${c.id}`, String(ms));
-    // coins reward
-    const reward = beatTarget ? 60 : 25;
-    this.addWallet(reward);
-    // grant the reward item on first target-beat
-    if (beatTarget) this.unlockItem(c.reward, `${c.name} target beaten`);
-    // submit trial time
-    if (BACKEND_READY && this.authUser) {
-      setTrialTime(this.authUser.id, c.id, ms).catch(() => undefined);
-    }
-    this.sfx.win();
-    this.clearCircuit();
-    this.endRun(true);
-  }
-
-  /* ---------------- collection / inventory ---------------- */
-  addWallet(n: number) {
+  private addCash(n: number) {
     if (n <= 0) return;
     this.wallet += n;
-    this.missionInc("coins", n);
-    if (BACKEND_READY && this.authUser) addCoins(this.authUser.id, n).catch(() => undefined);
-    this.cbs.onWallet?.(this.wallet);
-  }
-
-  syncProfile(uid: string) {
-    if (!BACKEND_READY) return;
-    fetchCoins(uid).then((c) => {
-      this.wallet = c;
-      this.cbs.onWallet?.(c);
-    }).catch(() => undefined);
-    fetchInventory(uid).then((items) => {
-      for (const it of items) this.owned.add(it);
-      this.cbs.onInventory?.([...this.owned]);
-    }).catch(() => undefined);
-  }
-
-  unlockItem(id: string, reason: string) {
-    if (this.owned.has(id)) return;
-    this.owned.add(id);
-    if (BACKEND_READY && this.authUser) grantItem(this.authUser.id, id).catch(() => undefined);
-    this.cbs.onInventory?.([...this.owned]);
-    this.popupAt(this.pos.clone().add(new THREE.Vector3(0, 2.6, 0)), `UNLOCKED: ${this.itemName(id)}`, "gold");
-    this.sfx.unlock();
-    void reason;
-  }
-
-  private itemName(id: string): string {
-    return GLOVES.find((g) => g.id === id)?.name ?? SUITS.find((s) => s.id === id)?.name ?? id;
-  }
-
-  equipGlove(id: string) {
-    if (!this.owned.has(id)) return;
-    this.equippedGlove = id;
-    localStorage.setItem("websling-glove", id);
-    this.applyGlove();
-  }
-
-  equipSuit(id: string) {
-    if (!this.owned.has(id)) return;
-    this.equippedSuit = id;
-    localStorage.setItem("websling-suit", id);
-    this.rebuildPlayerRig();
-  }
-
-  /** Spend coins at the kiosk; returns the new wallet or null on failure. */
-  buyItem(id: string, price: number): number | null {
-    if (this.owned.has(id) || this.wallet < price) return null;
-    this.wallet -= price;
-    this.owned.add(id);
-    if (BACKEND_READY && this.authUser) {
-      spendCoins(this.authUser.id, price).catch(() => undefined);
-      grantItem(this.authUser.id, id).catch(() => undefined);
-    }
-    this.cbs.onWallet?.(this.wallet);
-    this.cbs.onInventory?.([...this.owned]);
-    this.sfx.unlock();
-    return this.wallet;
-  }
-
-  private applyGlove() {
-    const g = GLOVES.find((x) => x.id === this.equippedGlove) ?? GLOVES[0];
-    const col = new THREE.Color(g.tint);
-    (this.webLine.material as THREE.LineBasicMaterial).color.copy(col);
-    (this.webGlow.material as THREE.LineBasicMaterial).color.copy(col);
-    for (const s of this.webShots) (s.mesh.material as THREE.MeshBasicMaterial).color.copy(col);
-  }
-
-  private gloveSwingBonus(): number {
-    return GLOVES.find((x) => x.id === this.equippedGlove)?.swingBonus ?? 0;
-  }
-
-  /* ---------------- story / missions ---------------- */
-  currentMission(): Mission | null {
-    if (this.missionDone || this.missionIdx >= MISSIONS.length) return null;
-    return MISSIONS[this.missionIdx];
-  }
-
-  missionIndex(): number {
-    return this.missionIdx;
-  }
-
-  missionObjectiveProgress(): { obj: ObjectiveDef; cur: number }[] {
-    const m = this.currentMission();
-    if (!m) return [];
-    return m.objectives.map((obj) => ({ obj, cur: Math.min(obj.target, this.missionProg[obj.id] ?? 0) }));
-  }
-
-  private missionInc(kind: ObjectiveDef["kind"], n: number, circuitId?: string) {
-    const m = this.currentMission();
-    if (!m) return;
-    let changed = false;
-    for (const obj of m.objectives) {
-      if (obj.kind !== kind) continue;
-      if (obj.kind === "circuit" && obj.circuitId && obj.circuitId !== circuitId) continue;
-      const cur = this.missionProg[obj.id] ?? 0;
-      if (cur >= obj.target) continue;
-      this.missionProg[obj.id] = Math.min(obj.target, cur + n);
-      changed = true;
-    }
-    if (changed) this.checkMissionComplete();
-  }
-
-  private checkMissionComplete() {
-    const m = this.currentMission();
-    if (!m) return;
-    const done = m.objectives.every((obj) => (this.missionProg[obj.id] ?? 0) >= obj.target);
-    if (!done) return;
-    // grant rewards
-    this.wallet += m.rewardCoins;
-    if (BACKEND_READY && this.authUser) addCoins(this.authUser.id, m.rewardCoins).catch(() => undefined);
-    this.cbs.onWallet?.(this.wallet);
-    if (m.rewardItem) this.unlockItem(m.rewardItem, `Completed ${m.title}`);
-    this.sfx.mission();
-    this.popupAt(this.pos.clone().add(new THREE.Vector3(0, 3, 0)), "CHAPTER COMPLETE", "gold");
-    // advance
-    this.missionIdx++;
-    this.missionProg = {};
-    if (this.missionIdx >= MISSIONS.length) this.missionDone = true;
-    saveProgress({ idx: this.missionIdx, prog: this.missionProg, done: this.missionDone });
-    this.cbs.onMissionComplete?.(this.missionIdx - 1);
-  }
-
-  /** Load persisted story progress (called once on init / after session restore). */
-  loadStoryProgress() {
-    const p = loadProgress();
-    this.missionIdx = p.idx;
-    this.missionProg = p.prog;
-    this.missionDone = p.done;
-    const g = localStorage.getItem("websling-glove");
-    if (g && this.owned.has(g)) this.equippedGlove = g;
-    const s = localStorage.getItem("websling-suit");
-    if (s && this.owned.has(s)) this.equippedSuit = s;
-    this.applyGlove();
-    if (this.equippedSuit !== "suit-spider") this.rebuildPlayerRig();
-  }
-
-  private rebuildPlayerRig() {
-    const suit = SUITS.find((s) => s.id === this.equippedSuit) ?? SUITS[0];
-    const oldRot = this.player.rotation.y;
-    this.playerRoot.remove(this.player);
-    this.disposeRig(this.rig);
-    this.rig = buildR6Rig({
-      head: suit.head,
-      torso: suit.torso,
-      arms: suit.arms,
-      legs: suit.legs,
-      eye: suit.eye,
-      headTex: suit.id === "suit-spider" ? spiderStyle().headTex : null,
-      torsoTex: suit.id === "suit-spider" ? spiderStyle().torsoTex : null,
-      armTex: suit.id === "suit-spider" ? spiderStyle().armTex : null,
-      spider: suit.id === "suit-spider",
-    });
-    this.player = this.rig.group;
-    this.player.position.set(0, 0, 0);
-    this.player.rotation.y = oldRot;
-    this.player.add(this.glider); // keep the web-chute on the fresh rig
-    this.playerRoot.add(this.player);
-  }
-
-  private disposeRig(rig: Rig) {
-    rig.group.traverse((o) => {
-      const mesh = o as THREE.Mesh;
-      if (mesh.isMesh) {
-        mesh.geometry.dispose();
-        const m = mesh.material;
-        if (Array.isArray(m)) m.forEach((x) => x.dispose());
-        else m.dispose();
-      }
-    });
-  }
-
-  /** Proximity unlock: the Web-Slinger on the Unisphere. */
-  private checkWebslinger() {
-    if (this.webslingerFound || this.owned.has("suit-webslinger")) return;
-    if (this.pos.distanceTo(this.city.webslingerPos) < 12) {
-      this.webslingerFound = true;
-      this.unlockItem("suit-webslinger", "found the Web-Slinger");
-      this.particles.burst(this.city.webslingerPos, 40, ["#ffcf3f", "#ffffff"], 10, 1.2, 3);
-    }
+    saveCash(this.wallet);
   }
 
   /* ---------------- physics ---------------- */
   private step(h: number) {
-    // parkour timers
     this.jumpBufT = Math.max(0, this.jumpBufT - h);
     this.coyoteT = this.grounded ? 0.12 : Math.max(0, this.coyoteT - h);
     this.slideCool = Math.max(0, this.slideCool - h);
     this.dashCd = Math.max(0, this.dashCd - h);
     this.dashT = Math.max(0, this.dashT - h);
     this.touchWallT = Math.max(0, this.touchWallT - h);
-    this.webShotCd = Math.max(0, this.webShotCd - h);
 
     const fwdH = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
     const rightH = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
@@ -1793,16 +1552,15 @@ export class Engine {
     if (this.keys.has("KeyD")) wish.add(rightH);
     if (this.keys.has("KeyA")) wish.sub(rightH);
     // virtual joystick (touch): up = forward
-    wish.addScaledVector(fwdH, -this.touch.joyY);
-    wish.addScaledVector(rightH, this.touch.joyX);
+    wish.addScaledVector(fwdH, -this.touchMove.y);
+    wish.addScaledVector(rightH, this.touchMove.x);
     if (wish.lengthSq() > 0) wish.normalize();
-    const joyMag = Math.hypot(this.touch.joyX, this.touch.joyY);
-
+    const joyMag = Math.hypot(this.touchMove.x, this.touchMove.y);
     const hs0 = Math.hypot(this.vel.x, this.vel.z);
 
-    // ---- wall climb ----
+    // wall climb
     if (this.climbing) {
-      this.handleClimb(h);
+      this.handleClimb(h, wish, fwdH, rightH);
       return;
     }
     if (!this.grounded && !this.attached && !this.gliding && this.touchWallT > 0) {
@@ -1810,7 +1568,6 @@ export class Engine {
       if (into > 0.3) {
         this.climbing = true;
         this.wallN.copy(this.touchWallN);
-        this.wallBox = this.touchWallBox;
         this.vel.set(0, 0, 0);
         this.sliding = false;
         this.sfx.webGrab();
@@ -1818,32 +1575,25 @@ export class Engine {
       }
     }
 
-    // ---- slide state machine ----
+    // slide
     if (this.sliding) {
       this.slideT += h;
-      const slideHeld = this.slideHeld || this.touch.slide;
+      const slideHeld = this.slideHeld || this.touchSlide;
       if (!this.grounded || this.slideT > 1.15 || (!slideHeld && this.slideT > 0.3) || hs0 < 4.5) {
         this.sliding = false;
         this.slideCool = 0.45;
       }
-    } else if ((this.slideHeld || this.touch.slide) && this.grounded && this.slideCool <= 0 && hs0 > 8) {
+    } else if ((this.slideHeld || this.touchSlide) && this.grounded && this.slideCool <= 0 && hs0 > 8) {
       this.sliding = true;
       this.slideT = 0;
       const boost = 1 + Math.min(0.35, 4 / Math.max(hs0, 1));
       this.vel.x *= boost;
       this.vel.z *= boost;
       this.sfx.slide();
-      this.particles.burst(
-        _v.set(this.pos.x, this.pos.y - R + 0.15, this.pos.z),
-        12,
-        ["#8a93b8", "#aab3d4", "#5b6488"],
-        5,
-        0.5,
-        2
-      );
+      this.particles.burst(_v.set(this.pos.x, this.pos.y - R + 0.15, this.pos.z), 12, ["#8a93b8", "#aab3d4", "#5b6488"], 5, 0.5, 2);
     }
 
-    // ---- jump (buffered + coyote, variable height) ----
+    // jump
     if (this.jumpBufT > 0 && (this.grounded || this.coyoteT > 0)) {
       this.sliding = false;
       this.vel.y = 14.6;
@@ -1852,37 +1602,29 @@ export class Engine {
       this.jumpBufT = 0;
       this.jumpStretchT = 1;
       this.sfx.jump();
-      this.particles.burst(
-        _v.set(this.pos.x, this.pos.y - R + 0.1, this.pos.z),
-        7,
-        ["#aef3ff", "#ffffff"],
-        3.4,
-        0.35,
-        1.6
-      );
+      this.particles.burst(_v.set(this.pos.x, this.pos.y - R + 0.1, this.pos.z), 7, ["#aef3ff", "#ffffff"], 3.4, 0.35, 1.6);
     }
     if (this.jumpCut) {
       this.jumpCut = false;
       if (this.vel.y > 5 && !this.grounded) this.vel.y *= 0.55;
     }
 
-    // ---- glide / parachute (air) & brake (ground) ----
+    // glide
     this.gliding = false;
-    const glideHeld = this.glideHeld || this.touch.glide;
+    const glideHeld = this.glideHeld || this.touchGlide;
     if (glideHeld && !this.grounded) {
       if (this.attached) this.detach(false);
       this.gliding = true;
       this.sliding = false;
+      if (this.gliderS < 0.2) this.sfx.glide();
     }
 
     if (this.grounded) {
       if (glideHeld) {
-        // hard brake
         const f = Math.exp(-3.4 * h);
         this.vel.x *= f;
         this.vel.z *= f;
       } else if (this.sliding) {
-        // low-friction slide with light steering
         this.vel.addScaledVector(wish, 11 * h);
         const f = Math.exp(-0.45 * h);
         this.vel.x *= f;
@@ -1892,8 +1634,7 @@ export class Engine {
         const damp = wish.lengthSq() > 0 ? 2.2 : 9;
         this.vel.x *= Math.exp(-damp * h);
         this.vel.z *= Math.exp(-damp * h);
-        const cap =
-          this.keys.has("ShiftLeft") || this.keys.has("ShiftRight") || joyMag > 0.85 ? 26 : 15;
+        const cap = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight") || joyMag > 0.85 ? 26 : 15;
         const hs = Math.hypot(this.vel.x, this.vel.z);
         if (hs > cap) {
           this.vel.x *= cap / hs;
@@ -1903,14 +1644,13 @@ export class Engine {
     } else {
       this.vel.addScaledVector(wish, (this.gliding ? 30 : 21) * h);
       if (this.gliding) {
-        // canopy physics: soft drag + clamped fall speed
         const f = Math.exp(-0.85 * h);
         this.vel.x *= f;
         this.vel.z *= f;
         if (this.vel.y < -5.5) this.vel.y = -5.5;
       }
       const hs = Math.hypot(this.vel.x, this.vel.z);
-      const cap = this.attached ? 62 : this.dashT > 0 ? 70 : 55;
+      const cap = this.attached ? 62 + this.swingBonus : this.dashT > 0 ? 70 : 55;
       if (hs > cap) {
         this.vel.x *= cap / hs;
         this.vel.z *= cap / hs;
@@ -1926,113 +1666,157 @@ export class Engine {
     this.vel.y -= GRAV * h;
     this.pos.addScaledVector(this.vel, h);
 
-    // story: accumulate web-swing distance
-    if (this.attached) {
-      this.missionSwingBuf += Math.hypot(this.vel.x, this.vel.z) * h;
-      this.missionFlushT += h;
-      if (this.missionFlushT >= 0.5) {
-        this.missionInc("swing", Math.floor(this.missionSwingBuf));
-        this.missionSwingBuf -= Math.floor(this.missionSwingBuf);
-        this.missionFlushT = 0;
-      }
-    }
-
     // rope constraint
     if (this.attached) {
-      const dx = this.pos.x - this.anchor.x;
-      const dy = this.pos.y - this.anchor.y;
-      const dz = this.pos.z - this.anchor.z;
-      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      if (dist > this.ropeLen && dist > 0.0001) {
-        const nx = dx / dist;
-        const ny = dy / dist;
-        const nz = dz / dist;
-        this.pos.set(this.anchor.x + nx * this.ropeLen, this.anchor.y + ny * this.ropeLen, this.anchor.z + nz * this.ropeLen);
-        const vn = this.vel.x * nx + this.vel.y * ny + this.vel.z * nz;
-        if (vn > 0) this.vel.addScaledVector(_n.set(nx, ny, nz), -vn);
+      const rope = _v.subVectors(this.pos, this.anchor);
+      const d = rope.length();
+      if (d > this.ropeLen) {
+        rope.divideScalar(d);
+        this.pos.copy(this.anchor).addScaledVector(rope, this.ropeLen);
+        const vr = this.vel.dot(rope);
+        if (vr > 0) this.vel.addScaledVector(rope, -vr);
       }
-      if (dist < 4 || this.pos.y > this.anchor.y + 3 || dist > 96) this.detach(false);
     }
 
     // buildings
-    this.grounded = false;
+    const prevY = this.pos.y;
+    this.touchWallT = 0;
     for (const b of this.city.boxes) {
-      const ex = b.hx + R;
-      const ez = b.hz + R;
+      const by0 = b.y0 ?? 0;
+      const ex = b.hx + R * 0.6;
+      const ez = b.hz + R * 0.6;
       const ox = this.pos.x - b.cx;
       const oz = this.pos.z - b.cz;
-      const by0 = b.y0 ?? 0;
       if (ox < -ex || ox > ex || oz < -ez || oz > ez || this.pos.y > b.top + R || this.pos.y < by0 - 1) continue;
       const cx = THREE.MathUtils.clamp(this.pos.x, b.cx - b.hx, b.cx + b.hx);
       const cy = THREE.MathUtils.clamp(this.pos.y, by0, b.top);
       const cz = THREE.MathUtils.clamp(this.pos.z, b.cz - b.hz, b.cz + b.hz);
-      let nx = this.pos.x - cx;
-      let ny = this.pos.y - cy;
-      let nz = this.pos.z - cz;
-      const d2 = nx * nx + ny * ny + nz * nz;
-      if (d2 > R * R) continue;
-      if (d2 < 1e-6) {
-        this.pos.y = b.top + R;
-        if (this.vel.y < 0) this.vel.y = 0;
-        this.grounded = true;
-        continue;
-      }
-      const d = Math.sqrt(d2);
-      nx /= d;
-      ny /= d;
-      nz /= d;
-      const push = R - d;
-      this.pos.x += nx * push;
-      this.pos.y += ny * push;
-      this.pos.z += nz * push;
-      const vn = this.vel.x * nx + this.vel.y * ny + this.vel.z * nz;
-      if (vn < 0) this.vel.addScaledVector(_n.set(nx, ny, nz), -vn);
-      if (ny > 0.55) {
-        this.grounded = true;
-        this.vel.x *= 0.995;
-        this.vel.z *= 0.995;
-      } else if (Math.abs(ny) < 0.5) {
-        // remember the side wall we're pressed against (for climbing)
-        this.touchWallN.set(nx, 0, nz).normalize();
-        this.touchWallBox = b;
-        this.touchWallT = 0.14;
+      const dx = this.pos.x - cx;
+      const dy = this.pos.y - cy;
+      const dz = this.pos.z - cz;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < R * R) {
+        const d = Math.sqrt(d2) || 0.0001;
+        const push = (R - d) / d;
+        this.pos.x += dx * push;
+        this.pos.y += dy * push;
+        this.pos.z += dz * push;
+        const nx = dx / d;
+        const ny = dy / d;
+        const nz = dz / d;
+        const vn = this.vel.x * nx + this.vel.y * ny + this.vel.z * nz;
+        if (vn < 0) {
+          this.vel.x -= nx * vn * 1.02;
+          this.vel.y -= ny * vn * 1.02;
+          this.vel.z -= nz * vn * 1.02;
+        }
+        if (ny > 0.55 && prevY >= b.top - 0.4) {
+          if (!this.grounded) this.land(this.vel.y);
+          this.grounded = true;
+          this.pos.y = Math.max(this.pos.y, b.top + R);
+        } else if (Math.abs(ny) < 0.55) {
+          this.touchWallT = 0.14;
+          this.touchWallN.set(nx, 0, nz).normalize();
+        }
       }
     }
 
     // ground
     if (this.pos.y < R) {
-      const fallV = this.vel.y;
+      if (!this.grounded) this.land(this.vel.y);
       this.pos.y = R;
       if (this.vel.y < 0) this.vel.y = 0;
-      if (!this.grounded || fallV < -5) this.land(fallV);
       this.grounded = true;
+    } else {
+      // check we still stand on something
+      if (this.grounded) {
+        let onSomething = this.pos.y <= R + 0.05;
+        for (const b of this.city.boxes) {
+          if (
+            this.pos.x > b.cx - b.hx - 0.3 && this.pos.x < b.cx + b.hx + 0.3 &&
+            this.pos.z > b.cz - b.hz - 0.3 && this.pos.z < b.cz + b.hz + 0.3 &&
+            Math.abs(this.pos.y - R - b.top) < 0.5
+          ) {
+            onSomething = true;
+            break;
+          }
+        }
+        if (!onSomething) this.grounded = false;
+      }
     }
+
+    // hard swing-floor catch
+    if (this.attached && this.grounded && this.attachT > 0.5) this.touchGroundDuringSwing = true;
+    if (this.attached && this.touchGroundDuringSwing && hs0 < 3) this.detach(false);
 
     // world bounds
-    const LIM = WORLD_SPAN + 250;
-    if (Math.abs(this.pos.x) > LIM) {
-      this.pos.x = Math.sign(this.pos.x) * LIM;
-      this.vel.x *= -0.3;
-    }
-    if (Math.abs(this.pos.z) > LIM) {
-      this.pos.z = Math.sign(this.pos.z) * LIM;
-      this.vel.z *= -0.3;
-    }
-    if (this.pos.y > 260) {
-      this.pos.y = 260;
-      if (this.vel.y > 0) this.vel.y = 0;
+    const B = 420;
+    this.pos.x = THREE.MathUtils.clamp(this.pos.x, -B, B);
+    this.pos.z = THREE.MathUtils.clamp(this.pos.z, -B, B);
+  }
+
+  private handleClimb(h: number, wish: THREE.Vector3, fwdH: THREE.Vector3, rightH: THREE.Vector3) {
+    this.climbPhase += h * 5;
+    const up = (this.keys.has("KeyW") ? 1 : 0) - (this.keys.has("KeyS") ? 1 : 0);
+    const sideVec = _n.set(this.wallN.z, 0, -this.wallN.x);
+    const side = wish.dot(sideVec);
+    this.vel.set(0, up * 6.5, 0).addScaledVector(sideVec, side * 5);
+    this.pos.addScaledVector(this.vel, h);
+
+    // jump off the wall
+    if (this.jumpBufT > 0) {
+      this.jumpBufT = 0;
+      this.climbing = false;
+      this.vel.copy(this.wallN).multiplyScalar(11);
+      this.vel.y = 13.5;
+      this.grounded = false;
+      this.jumpStretchT = 1;
+      this.sfx.jump();
+      return;
     }
 
-    if (this.grounded && this.attached && this.attachT > 0.2) this.touchGroundDuringSwing = true;
+    // let go when not pressing into the wall
+    const into = wish.dot(_t.copy(this.wallN).multiplyScalar(-1));
+    if (into < -0.2 || (wish.lengthSq() < 0.01 && !this.keys.has("KeyW") && !this.keys.has("KeyS"))) {
+      // small hop off
+      this.climbing = false;
+      this.vel.copy(this.wallN).multiplyScalar(4);
+      this.vel.y = Math.max(this.vel.y, 3);
+      this.grounded = false;
+    }
+
+    // stick to the surface
+    let bestD = Infinity;
+    let bestN: THREE.Vector3 | null = null;
+    for (const b of this.city.boxes) {
+      const cx = THREE.MathUtils.clamp(this.pos.x, b.cx - b.hx, b.cx + b.hx);
+      const cy = THREE.MathUtils.clamp(this.pos.y, b.y0 ?? 0, b.top);
+      const cz = THREE.MathUtils.clamp(this.pos.z, b.cz - b.hz, b.cz + b.hz);
+      const d2 = (this.pos.x - cx) ** 2 + (this.pos.y - cy) ** 2 + (this.pos.z - cz) ** 2;
+      if (d2 < bestD) {
+        bestD = d2;
+        bestN = _v.set(this.pos.x - cx, this.pos.y - cy, this.pos.z - cz);
+        if (bestN.lengthSq() < 0.001) bestN.copy(this.wallN);
+        else bestN.normalize();
+      }
+    }
+    if (bestN) this.wallN.lerp(bestN.clone(), 0.2).normalize();
+    const gap = Math.sqrt(Math.max(0, bestD));
+    if (gap > R + 0.6) {
+      this.climbing = false;
+      this.grounded = false;
+      return;
+    }
+    this.pos.addScaledVector(this.wallN, (R - gap) * 0.5);
+    void fwdH;
+    void rightH;
   }
 
   private land(fallV: number) {
-    if (this.attached && this.attachT > 0.2) this.detach(false);
     this.landTricks();
     const soft = this.gliding;
     this.landSquashT = soft ? 0.5 : Math.min(1, 0.4 + -fallV / 70);
     if (soft) {
-      // parachute touchdown — gentle, and it protects the combo
       this.sfx.thud(false);
       this.particles.burst(this.pos.clone().setY(this.pos.y - R + 0.2), 10, ["#aef3ff", "#8a93b8"], 3.4, 0.5, 2);
       if (this.combo >= 2) this.popupAt(_v.set(this.pos.x, this.pos.y + 1.4, this.pos.z), "COMBO SAVED", "cyan");
@@ -2050,17 +1834,36 @@ export class Engine {
     }
   }
 
-  /* ---------------- per-frame ---------------- */
-  private frame(dt: number) {
+  /* ---------------- scoring ---------------- */
+  private collectToken(tk: { group: THREE.Group; active: boolean; respawn: number }) {
+    tk.active = false;
+    tk.group.visible = false;
+    tk.respawn = 2.6;
+    this.collected++;
+    const mult = Math.max(1, this.combo);
+    const val = 100 * mult;
+    this.score += val;
+    this.combo++;
+    this.maxCombo = Math.max(this.maxCombo, this.combo);
+    this.sfx.collect(this.combo);
+    this.particles.burst(tk.group.position, 18, ["#ffcf3f", "#fff3b0", "#ffffff"], 7, 0.6, 2.4);
+    this.popupAt(tk.group.position.clone(), `+${val}`, "gold");
+    if (this.collected >= GOAL && this.mode === "solo") this.endRun(true);
+  }
+
+  /* ---------------- frame ---------------- */
+  private frame() {
+    const now = performance.now();
+    let dt = Math.min(0.05, (now - this.last) / 1000);
+    this.last = now;
     this.elapsed += dt;
 
-    // slow-mo eases in and out; physics & cooldowns run on scaled time, the run clock stays fair
     const tsTarget = this.slowmoT > 0 ? 0.3 : 1;
     this.timeScale += (tsTarget - this.timeScale) * (1 - Math.exp(-14 * dt));
     if (this.slowmoT > 0) this.slowmoT -= dt;
     const gdt = dt * this.timeScale;
 
-    if (this.phase === "playing") {
+    if (this.phase === "playing" && !this.shopOpen) {
       if (this.countdown > 0) {
         this.countdown -= dt;
         if (this.countdown <= 0) {
@@ -2076,196 +1879,186 @@ export class Engine {
         }
         this.cooldown = Math.max(0, this.cooldown - gdt);
         this.refireT = Math.max(0, this.refireT - gdt);
-        if ((this.mouseWeb || this.touch.web) && !this.attached && this.cooldown <= 0 && this.refireT <= 0) {
+        this.webShotCd = Math.max(0, this.webShotCd - gdt);
+        this.swingHitCd = Math.max(0, this.swingHitCd - gdt);
+        if ((this.mouseWeb || this.touchWeb) && !this.attached && this.cooldown <= 0 && this.refireT <= 0) {
           this.tryWeb();
           this.refireT = 0.3;
         }
 
-        // timer (frozen in free play)
-        if (this.mode !== "free") {
+        // timer (solo only)
+        if (this.mode === "solo") {
           this.time -= dt;
-          const sec = Math.ceil(this.time);
-          if (sec <= 5 && sec >= 0 && sec !== this.lastTickSec) {
-            this.lastTickSec = sec;
-            this.sfx.countTick();
-          }
           if (this.time <= 0) {
             this.time = 0;
             this.endRun(false);
           }
         }
 
+        // combat timers
+        this.invulnT = Math.max(0, this.invulnT - dt);
+        this.punchCooldown = Math.max(0, this.punchCooldown - dt);
+        this.attackAnim = Math.max(0, this.attackAnim - dt * 3.4);
+        this.hitFlash = Math.max(0, this.hitFlash - dt * 3);
+        this.trickAnimT = Math.max(0, this.trickAnimT - dt * 2);
+        if (this.comboT > 0) {
+          this.comboT -= dt;
+          if (this.comboT <= 0) this.comboCount = 0;
+        }
+        if (!this.grounded) this.trickAirTime += dt;
+        else this.trickAirTime = 0;
+
         // tokens
-        for (const t of this.tokens) {
-          if (!t.active) {
-            t.respawn -= dt;
-            if (t.respawn <= 0) this.respawnToken(t);
+        for (const tk of this.tokens) {
+          if (!tk.active) {
+            tk.respawn -= dt;
+            if (tk.respawn <= 0) {
+              tk.active = true;
+              tk.group.visible = true;
+            }
             continue;
           }
-          t.group.rotation.y += 2.4 * dt;
-          t.group.position.y = t.baseY + Math.sin(this.elapsed * 2 + t.phase) * 0.8;
-          if (t.group.position.distanceToSquared(this.pos) < 2.7 * 2.7) this.collectToken(t);
+          tk.group.rotation.y += 1.4 * dt;
+          tk.group.position.y = tk.baseY + Math.sin(this.elapsed * 2 + tk.phase) * 0.8;
+          if (tk.group.position.distanceToSquared(this.pos) < 3.2 * 3.2) this.collectToken(tk);
         }
 
-        // swing web trail
-        this.trailAcc += dt * Math.min(60, this.vel.length() * 2.2);
-        if (this.attached && this.vel.length() > 14 && this.trailAcc > 1) {
-          this.trailAcc = 0;
-          this.particles.burst(this.pos, 1, ["#35e0ff", "#8ae9ff"], 1.4, 0.5);
-        }
-      }
-      const speed = this.vel.length();
-      this.sfx.setWind(this.countdown > 0 ? 0 : speed);
-      this.updateVisuals(dt, speed);
-      this.updateCamera(dt, speed);
-    } else if (this.phase === "menu") {
-      const a = this.elapsed * 0.075;
-      this.camera.position.set(Math.sin(a) * 175, 92 + Math.sin(this.elapsed * 0.2) * 8, Math.cos(a) * 175);
-      this.camera.lookAt(0, 34, 0);
-      this.camera.fov = 60;
-      this.camera.updateProjectionMatrix();
-      for (const t of this.tokens) {
-        t.group.rotation.y += 1.4 * dt;
-        t.group.position.y = t.baseY + Math.sin(this.elapsed * 2 + t.phase) * 0.8;
-      }
-    } else if (this.phase === "won" || this.phase === "lost") {
-      // slow celebratory orbit around player
-      const a = this.elapsed * 0.3;
-      this.camera.position.set(this.pos.x + Math.sin(a) * 9, this.pos.y + 3.2, this.pos.z + Math.cos(a) * 9);
-      this.camera.lookAt(this.pos.x, this.pos.y + 1, this.pos.z);
-    }
-
-    // multiplayer: broadcast state, animate ghosts, prune stale rivals
-    if (this.transport) {
-      this.netAcc += dt;
-      if (this.netAcc >= 0.08) {
-        this.netAcc = 0;
-        this.sendNet();
-      }
-      this.updateGhosts(dt);
-      this.pruneGhosts();
-      this.rosterAcc += dt;
-      if (this.rosterAcc > 0.25) {
-        this.rosterAcc = 0;
-        this.rosterCache = this.standingsList();
-        this.cbs.onRoster(this.rosterCache);
-      }
-    }
-
-    // beacon pulse
-    const pulse = 0.55 + 0.45 * Math.sin(this.elapsed * 3.1);
-    this.city.beaconMat.color.setRGB(0.55 + pulse * 0.45, 0.1 + pulse * 0.17, 0.16 + pulse * 0.17);
-
-    // crowd + combat
-    if (this.countdown <= 0) {
-      this.invulnT = Math.max(0, this.invulnT - dt);
-      this.punchCooldown = Math.max(0, this.punchCooldown - dt);
-      this.attackAnim = Math.max(0, this.attackAnim - dt * 3.4);
-      this.hitFlash = Math.max(0, this.hitFlash - dt * 3);
-      this.trickAnimT = Math.max(0, this.trickAnimT - dt * 2); // one full roll in ~0.5s
-      if (this.comboT > 0) {
-        this.comboT -= dt;
-        if (this.comboT <= 0) this.comboCount = 0;
-      }
-    }
-    this.swingHitCd = Math.max(0, this.swingHitCd - dt);
-    this.crowd.update(dt, {
-      active: this.phase === "playing" && this.countdown <= 0,
-      playerPos: this.pos,
-      playerVel: this.vel,
-      swingHitCd: this.swingHitCd,
-      invuln: this.invulnT > 0,
-      elapsed: this.elapsed,
-      punches: this.punches,
-      damagePlayer: (n, from) => this.damagePlayer(n, from),
-      onPunchHit: (heavy, at) => this.onPunchHit(heavy, at),
-      onThugKilled: (at) => this.onThugKilled(at),
-      onSwingHit: (pts, at) => {
-        this.score += pts;
-        this.swingHitCd = 0.45;
-        this.shake = Math.min(1.3, this.shake + 0.3);
-        this.sfx.swingHit();
-        this.particles.burst(at, 16, ["#ffffff", "#35e0ff", "#ffcf3f"], 9, 0.5, 2.6);
-        this.popupAt(at, `SWING HIT +${pts}`, "gold");
-      },
-      onCoin: () => {
-        this.coins++;
-        this.score += 25;
-        this.sfx.coin();
-      },
-      onHeal: (at) => {
-        this.hp = Math.min(100, this.hp + 25);
-        this.sfx.heal();
-        this.popupAt(at, "+25 HP", "cyan");
-        this.particles.burst(at, 14, ["#52ffa8", "#ffffff"], 5, 0.5, 2.2);
-      },
-      particles: this.particles,
-      sfx: this.sfx,
-    });
-
-    // easter egg proximity scan
-    if (this.phase === "playing") {
-      this.eggScanT -= dt;
-      if (this.eggScanT <= 0) {
-        this.eggScanT = 0.25;
-        for (const egg of this.city.eggs) {
-          if (this.eggsFound.has(egg.id)) continue;
-          if (this.pos.distanceToSquared(egg.pos) < egg.r * egg.r) {
-            this.eggsFound.add(egg.id);
-            this.score += 500;
-            this.missionInc("eggs", 1);
-            this.sfx.sparkle();
-            if (egg.id === "tung") this.sfx.tung();
-            this.popupAt(_v.set(this.pos.x, this.pos.y + 2.2, this.pos.z), `EASTER EGG — ${egg.label} +500`, "gold");
-            this.particles.burst(this.pos, 30, ["#ffcf3f", "#ff4fd8", "#35e0ff", "#ffffff"], 10, 1, 3);
+        // easter eggs
+        this.eggScanT -= dt;
+        if (this.eggScanT <= 0) {
+          this.eggScanT = 0.5;
+          for (const egg of this.city.eggSpots) {
+            if (this.eggsFound.has(egg.id)) continue;
+            if (this.pos.distanceToSquared(egg.pos) < egg.r * egg.r) {
+              this.eggsFound.add(egg.id);
+              this.score += 500;
+              this.sfx.sparkle();
+              if (egg.id === "tung") this.sfx.tung();
+              this.popupAt(_v.set(this.pos.x, this.pos.y + 2.2, this.pos.z), `SECRET! ${egg.label} +500`, "gold");
+              this.particles.burst(this.pos, 30, ["#ffcf3f", "#ffffff", "#ff4fd8"], 10, 0.9, 3);
+            }
           }
         }
       }
+
+      // crowd + powers + market always tick while playing
+      this.market.tick(dt);
+      this.updatePowers(dt);
+      this.updateWebShots(dt);
+      this.crowd.update(dt, {
+        active: this.countdown <= 0,
+        playerPos: this.pos,
+        playerVel: this.vel,
+        swingHitCd: this.swingHitCd,
+        invuln: this.invulnT > 0,
+        elapsed: this.elapsed,
+        punches: this.punches,
+        damagePlayer: (n, from) => this.damagePlayer(n, from),
+        onPunchHit: (heavy, at) => this.onPunchHit(heavy, at),
+        onThugKilled: (at) => this.onThugKilled(at),
+        onSwingHit: (pts, at) => this.onSwingHit(pts, at),
+        onCoin: (at) => {
+          this.addCash(5);
+          this.score += 25;
+          this.popupAt(at, "+$5", "cash");
+        },
+        onHeal: (at) => {
+          this.hp = Math.min(this.maxHp, this.hp + 30);
+          this.popupAt(at, "+30 HP", "cyan");
+        },
+        particles: this.particles,
+        sfx: this.sfx,
+      });
+    } else {
+      // menu / paused / shop: keep the city breathing
+      this.updatePowers(dt * 0.4);
     }
 
-    // UFO drift + spin
+    // dealer proximity
+    this.nearDealerIdx = -1;
+    if (this.phase === "playing" && !this.shopOpen) {
+      let bestD = 5.2 * 5.2;
+      for (let i = 0; i < this.city.dealerSpots.length; i++) {
+        const sp = this.city.dealerSpots[i];
+        const d2 = (sp.x - this.pos.x) ** 2 + (sp.z - this.pos.z) ** 2;
+        if (d2 < bestD) {
+          bestD = d2;
+          this.nearDealerIdx = i;
+        }
+      }
+    }
+
+    const speed = this.vel.length();
+    this.updateVisuals(dt, speed);
+    this.updateCamera(dt, speed);
+
+    // ambient animation
     if (this.city.ufo) {
       this.city.ufo.rotation.y += dt * 0.5;
       this.city.ufo.position.y = 118 + Math.sin(this.elapsed * 0.6) * 6;
     }
-    this.updateWebShots(dt);
+    if (this.city.tung) this.city.tung.rotation.y = Math.sin(this.elapsed * 0.8) * 0.3;
+    const pulse = 0.55 + 0.45 * Math.sin(this.elapsed * 3.1);
+    this.city.beaconMat.color.setRGB(0.55 + pulse * 0.45, 0.1 + pulse * 0.17, 0.16 + pulse * 0.17);
 
+    this.sfx.setWind(Math.min(1, speed / 50));
     this.particles.update(dt);
+
+    // ---- comic post pass: ink outlines + screentone ----
+    this.slowmoMix += ((this.slowmoT > 0 ? 1 : 0) - this.slowmoMix) * (1 - Math.exp(-8 * dt));
+    const u = this.postMat.uniforms;
+    u.uTime.value = this.elapsed;
+    u.uSpeed.value = THREE.MathUtils.clamp((speed - 12) / 42, 0, 1);
+    u.uHit.value = this.hitFlash;
+    u.uSlowmo.value = this.slowmoMix;
+    this.renderer.setRenderTarget(this.rt);
     this.renderer.render(this.scene, this.camera);
+    this.renderer.setRenderTarget(null);
+    this.renderer.render(this.postScene, this.postCam);
 
     if (this.phase === "playing") this.emitHud();
   }
 
+  /* ---------------- visuals ---------------- */
   private updateVisuals(dt: number, speed: number) {
     const k = 1 - Math.exp(-13 * dt);
     const hs = Math.hypot(this.vel.x, this.vel.z);
 
-    // ---- animation timers ----
-    this.gaitPhase += hs * dt * 1.35; // stride rate scales with speed
-    if (this.climbing) this.climbPhase += (Math.abs(this.vel.y) * 1.1 + 2.5) * dt;
-    this.landSquashT = Math.max(0, this.landSquashT - dt * 4.2);
-    this.jumpStretchT = Math.max(0, this.jumpStretchT - dt * 5);
-    this.flinchT = Math.max(0, this.flinchT - dt * 3);
-    this.jabT = Math.max(0, this.jabT - dt * 5.5);
-
-    // ---- root: world placement + facing yaw ----
+    // root placement + facing
     this.playerRoot.position.set(this.pos.x, this.pos.y - R, this.pos.z);
-    this.playerRoot.visible = this.phase !== "menu";
     let targetYaw = this.yaw;
     if (this.climbing) targetYaw = Math.atan2(-this.wallN.x, -this.wallN.z);
-    else if (hs > 2.5) targetYaw = Math.atan2(this.vel.x, this.vel.z);
+    else if (this.attached || hs > 2.5) targetYaw = Math.atan2(this.vel.x, this.vel.z);
     let dy = targetYaw - this.playerRoot.rotation.y;
     while (dy > Math.PI) dy -= Math.PI * 2;
     while (dy < -Math.PI) dy += Math.PI * 2;
     this.playerRoot.rotation.y += dy * k;
 
-    // run bob: the root bounces with the stride, stronger when sprinting
-    const amp = Math.min(1, hs / 16);
-    const bob = this.grounded && !this.sliding ? Math.abs(Math.sin(this.gaitPhase)) * 0.1 * amp : 0;
-    this.playerRoot.position.y += bob;
+    // gait phase (distance-driven)
+    if (this.grounded && hs > 0.6) this.gaitPhase += hs * dt * 1.35;
+    if (this.climbing) this.climbPhase += (Math.abs(this.vel.y) * 1.1 + 2.5) * dt;
+    this.landSquashT = Math.max(0, this.landSquashT - dt * 4.2);
+    this.jumpStretchT = Math.max(0, this.jumpStretchT - dt * 5);
+    this.flinchT = Math.max(0, this.flinchT - dt * 3);
 
-    // ---- squash & stretch: landings, jumps, slides ----
-    const squash = Math.sin(Math.PI * Math.min(1, this.landSquashT)) * (this.landSquashT > 0.5 ? 0.32 : 0.32);
+    this.applyPose(dt);
+
+    // punch overlay
+    if (this.attackAnim > 0 && !this.attached) {
+      const punch = Math.sin(Math.min(1, this.attackAnim) * Math.PI);
+      const arm = this.punchArmSide === "R" ? this.rig.armR : this.rig.armL;
+      arm.rotation.x = -1.5 * punch;
+      arm.rotation.z = 0;
+      this.rig.torso.rotation.y = 0.5 * punch * (this.punchArmSide === "R" ? 1 : -1);
+    }
+
+    // hit flash
+    const flash = this.invulnT > 0.6 ? 0.9 : this.hitFlash * 0.7;
+    (this.rig.torso.material as THREE.MeshToonMaterial).emissive.setRGB(flash, flash * 0.1, flash * 0.1);
+    (this.rig.head.material as THREE.MeshToonMaterial).emissive.setRGB(flash * 0.6, 0, 0);
+
+    // squash & stretch + Buddha
+    const squash = Math.sin(Math.PI * Math.min(1, this.landSquashT)) * 0.32;
     const stretch = Math.sin(Math.PI * Math.min(1, this.jumpStretchT)) * 0.14;
     let sy = 1 - squash + stretch;
     let sxz = 1 + squash * 0.9 - stretch * 0.5;
@@ -2273,69 +2066,43 @@ export class Engine {
       sy = 0.58;
       sxz = 1.12;
     }
-    this.playerRoot.scale.y += (sy - this.playerRoot.scale.y) * Math.min(1, k * 2.2);
-    this.playerRoot.scale.x += (sxz - this.playerRoot.scale.x) * Math.min(1, k * 2.2);
+    this.buddhaS += ((this.buddhaT > 0 ? 1 : 0) - this.buddhaS) * Math.min(1, k * 1.6);
+    const buddhaF = 1 + this.buddhaS * 1.2;
+    this.playerRoot.scale.y += (sy * buddhaF - this.playerRoot.scale.y) * Math.min(1, k * 2.2);
+    this.playerRoot.scale.x += (sxz * buddhaF - this.playerRoot.scale.x) * Math.min(1, k * 2.2);
     this.playerRoot.scale.z = this.playerRoot.scale.x;
 
-    // ---- trick rotation on the inner rig (never fights the facing yaw) ----
-    const trickT = this.trickAnimT > 0 ? THREE.MathUtils.clamp(1 - this.trickAnimT / 0.5, 0, 1) : 0;
+    // trick rotation on inner rig
     if (this.trickAnimT > 0) {
-      const ang = trickT * Math.PI * 2;
-      if (this.trickAnimType === "flip") {
-        this.player.rotation.x = ang;
-        this.player.rotation.y += 0;
-      } else {
-        this.player.rotation.y = ang;
-      }
+      const t = THREE.MathUtils.clamp(1 - this.trickAnimT / 0.5, 0, 1);
+      const ang = t * Math.PI * 2;
+      if (this.trickAnimType === "flip") this.player.rotation.x = ang;
+      else this.player.rotation.z = ang;
     } else {
       this.player.rotation.x *= 0.75;
-      if (!this.attached && !this.climbing) this.player.rotation.y *= 0.75;
-      else this.player.rotation.y = 0;
+      this.player.rotation.z *= 0.75;
     }
 
-    // ---- pose ----
-    this.applyPose(this.rig, {
-      hs,
-      velY: this.vel.y,
-      grounded: this.grounded,
-      attached: this.attached,
-      k,
-      sliding: this.sliding,
-      gliding: this.gliding,
-      climbing: this.climbing,
-      dashT: this.dashT,
-      punchT: this.attackAnim > 0 && !this.attached ? 1 - this.attackAnim : 0,
-      punchArm: this.punchArmSide,
-      jabT: this.jabT,
-      trickT,
-      flinchT: this.flinchT,
-      gait: this.gaitPhase,
-      climb: this.climbPhase,
-      pitch: this.pitch,
-    });
+    // power aura
+    if (this.powerAura) {
+      this.powerAura.visible = !!this.currentPower;
+      if (this.powerAura.visible) {
+        const p = 4.6 + Math.sin(this.elapsed * 6) * 0.5;
+        this.powerAura.scale.setScalar(p * buddhaF);
+        (this.powerAura.material as THREE.SpriteMaterial).opacity = 0.4 + Math.sin(this.elapsed * 6) * 0.12;
+      }
+    }
 
-    // hit flash: briefly tint the rig red when damaged
-    const flash = this.invulnT > 0.6 ? 0.9 : this.hitFlash * 0.7;
-    (this.rig.torso.material as THREE.MeshToonMaterial).emissive.setRGB(flash, flash * 0.1, flash * 0.1);
-    (this.rig.head.material as THREE.MeshToonMaterial).emissive.setRGB(flash * 0.6, 0, 0);
-
-    // slide dust trail
+    // slide dust
     if (this.sliding && speed > 6) {
       this.trailAcc += dt * 40;
       if (this.trailAcc > 1) {
         this.trailAcc = 0;
-        this.particles.burst(
-          _v.set(this.pos.x - this.vel.x * 0.05, this.pos.y - R + 0.12, this.pos.z - this.vel.z * 0.05),
-          2,
-          ["#8a93b8", "#aab3d4"],
-          2.2,
-          0.4,
-          1.4
-        );
+        this.particles.burst(_v.set(this.pos.x - this.vel.x * 0.05, this.pos.y - R + 0.12, this.pos.z - this.vel.z * 0.05), 2, ["#8a93b8", "#aab3d4"], 2.2, 0.4, 1.4);
       }
     }
 
-    // web-chute deploy animation
+    // glider
     const gTarget = this.gliding ? 1 : 0.001;
     this.gliderS += (gTarget - this.gliderS) * (1 - Math.exp(-(this.gliding ? 15 : 20) * dt));
     this.glider.visible = this.gliderS > 0.02;
@@ -2344,26 +2111,13 @@ export class Engine {
       this.glider.scale.set(s, s * 0.94, s);
       this.glider.rotation.z = Math.sin(this.elapsed * 2.6) * 0.09 * this.gliderS;
       this.glider.rotation.x = THREE.MathUtils.clamp(this.vel.y * 0.014, -0.28, 0.3) * this.gliderS;
-      if (this.gliding) {
-        this.trailAcc += dt * 26;
-        if (this.trailAcc > 1) {
-          this.trailAcc = 0;
-          this.particles.burst(
-            _v.set(this.pos.x, this.pos.y - R - 0.4, this.pos.z),
-            1,
-            ["#aef3ff"],
-            1.1,
-            0.6,
-            0.6
-          );
-        }
-      }
     }
 
-    // blob shadow on highest surface below
+    // blob shadow
     let surfY = 0;
     for (const b of this.city.boxes) {
-      if (Math.abs(this.pos.x - b.cx) < b.hx && Math.abs(this.pos.z - b.cz) < b.hz && b.top < this.pos.y && b.top > surfY) surfY = b.top;
+      if (b.y0 !== undefined) continue;
+      if (this.pos.x > b.cx - b.hx && this.pos.x < b.cx + b.hx && this.pos.z > b.cz - b.hz && this.pos.z < b.cz + b.hz && b.top < this.pos.y && b.top > surfY) surfY = b.top;
     }
     const drop = this.pos.y - R - surfY;
     this.blob.visible = drop < 46;
@@ -2372,8 +2126,8 @@ export class Engine {
     const bs = 1 + drop * 0.012;
     this.blob.scale.set(bs, bs, 1);
 
-    // aim + web lines
-    const hand = _v.set(this.pos.x, this.pos.y + 1.75, this.pos.z); // raised grip hand
+    // web lines
+    const hand = _v.set(this.pos.x, this.pos.y + 1.6, this.pos.z);
     if (this.attached) {
       this.setLine(this.webLine, hand, this.anchor);
       this.setLine(this.webGlow, hand, this.anchor);
@@ -2382,35 +2136,178 @@ export class Engine {
       this.currentAnchor = null;
     } else {
       this.webLine.visible = this.webGlow.visible = false;
-      if (this.cooldown <= 0) {
+      if (this.cooldown <= 0 && this.phase === "playing" && !this.shopOpen) {
         const dir = this.aimDir(new THREE.Vector3());
         const hit = this.city.findAnchor(this.pos, dir);
         this.currentAnchor = hit;
         this.setLine(this.aimLine, hand, hit.point);
-        this.aimLine.computeLineDistances();
         this.aimLine.visible = true;
       } else {
         this.aimLine.visible = false;
-        this.currentAnchor = null;
       }
     }
-    void speed;
+
+    // dealers idle + face the player when close
+    for (const d of this.dealerRigs) {
+      const sp = this.city.dealerSpots[d.idx];
+      const dx = this.pos.x - sp.x;
+      const dz = this.pos.z - sp.z;
+      const near = dx * dx + dz * dz < 90;
+      const ty = near ? Math.atan2(dx, dz) : d.group.rotation.y;
+      let ddy = ty - d.group.rotation.y;
+      while (ddy > Math.PI) ddy -= Math.PI * 2;
+      while (ddy < -Math.PI) ddy += Math.PI * 2;
+      d.group.rotation.y += ddy * Math.min(1, dt * 4);
+      const bob = Math.sin(this.elapsed * 2 + d.idx) * 0.06;
+      d.rig.armL.rotation.x = bob;
+      d.rig.armR.rotation.x = -bob;
+      d.rig.head.rotation.y = Math.sin(this.elapsed * 0.7 + d.idx * 2) * 0.2;
+    }
+  }
+
+  private applyPose(dt: number) {
+    const r = this.rig;
+    const hs = Math.hypot(this.vel.x, this.vel.z);
+    const k = 1 - Math.exp(-13 * dt);
+    const sin = Math.sin;
+    const ph = this.gaitPhase;
+
+    let aLx = 0, aRx = 0, aLz = 0.08, aRz = -0.08, lLx = 0, lRx = 0, lLy = 0, lRy = 0, torsoX = 0, torsoY = 0, headX = 0;
+    let rootBob = 0;
+
+    if (this.climbing) {
+      const cp = this.climbPhase;
+      aLx = -2.5 + sin(cp) * 0.45;
+      aRx = -2.5 + sin(cp + Math.PI) * 0.45;
+      aLz = 0.35;
+      aRz = -0.35;
+      lLx = 0.7 + sin(cp + Math.PI) * 0.55;
+      lRx = 0.7 + sin(cp) * 0.55;
+      torsoX = 0.25;
+      headX = -0.5;
+    } else if (this.attached) {
+      aLx = -2.9;
+      aRx = -2.9;
+      aLz = 0.25;
+      aRz = -0.25;
+      const trail = Math.min(1, hs / 34);
+      lLx = 0.5 + trail * 0.9;
+      lRx = 0.35 + trail * 0.9;
+      lLy = 0.15;
+      lRy = -0.15;
+      torsoX = 0.5 + trail * 0.35;
+      headX = -0.55;
+    } else if (this.sliding) {
+      aLx = -0.5;
+      aRx = 0.9;
+      aRz = -0.4;
+      lLx = -1.15;
+      lRx = -0.35;
+      torsoX = 0.55;
+      headX = -0.2;
+    } else if (this.gliding) {
+      aLx = -2.5;
+      aRx = -2.5;
+      aLz = 0.5;
+      aRz = -0.5;
+      const sway = sin(this.elapsed * 3) * 0.18;
+      lLx = 0.25 + sway;
+      lRx = 0.25 - sway;
+      torsoX = 0.12;
+      headX = -0.3;
+    } else if (!this.grounded) {
+      if (this.dashT > 0) {
+        aLx = 1.9;
+        aRx = 1.9;
+        lLx = 0.7;
+        lRx = 0.4;
+        torsoX = 1.1;
+        headX = -0.5;
+      } else if (this.vel.y > 2) {
+        aLx = -1.1;
+        aRx = -1.1;
+        lLx = 0.85;
+        lRx = 0.45;
+        torsoX = -0.15;
+        headX = -0.2;
+      } else if (this.vel.y < -4) {
+        aLx = -0.5;
+        aRx = -0.5;
+        aLz = 0.5;
+        aRz = -0.5;
+        lLx = 0.3;
+        lRx = 0.3;
+        lLy = 0.25;
+        lRy = -0.25;
+        torsoX = 0.1;
+      } else {
+        aLx = -0.8;
+        aRx = -0.8;
+        lLx = 0.6;
+        lRx = 0.35;
+      }
+    } else if (hs > 0.6) {
+      const amp = Math.min(1, hs / 12);
+      const sw = sin(ph);
+      const sw2 = sin(ph + Math.PI);
+      aLx = sw * 0.95 * amp;
+      aRx = sw2 * 0.95 * amp;
+      lLx = sw2 * 0.85 * amp;
+      lRx = sw * 0.85 * amp;
+      lLy = sw2 * 0.12 * amp;
+      lRy = sw * 0.12 * amp;
+      torsoY = sw * 0.12 * amp;
+      torsoX = Math.min(0.5, hs * 0.02);
+      rootBob = Math.abs(sin(ph)) * 0.14 * amp;
+      headX = -torsoX * 0.4;
+    } else {
+      const br = sin(this.elapsed * 2.2) * 0.05;
+      aLx = br;
+      aRx = -br;
+      torsoX = 0.03;
+      headX = sin(this.elapsed * 0.6) * 0.06 - this.pitch * 0.25;
+    }
+
+    // flinch
+    if (this.flinchT > 0) {
+      const fl = this.flinchT;
+      torsoX -= 0.5 * fl;
+      headX += 0.4 * fl;
+      aLx += 0.7 * fl;
+      aRx += 0.7 * fl;
+    }
+
+    const lerp = (cur: number, target: number, kk: number) => cur + (target - cur) * kk;
+    r.armL.rotation.x = lerp(r.armL.rotation.x, aLx, k);
+    r.armR.rotation.x = lerp(r.armR.rotation.x, aRx, k);
+    r.armL.rotation.z = lerp(r.armL.rotation.z, aLz, k);
+    r.armR.rotation.z = lerp(r.armR.rotation.z, aRz, k);
+    r.legL.rotation.x = lerp(r.legL.rotation.x, lLx, k);
+    r.legR.rotation.x = lerp(r.legR.rotation.x, lRx, k);
+    r.legL.rotation.y = lerp(r.legL.rotation.y, lLy, k);
+    r.legR.rotation.y = lerp(r.legR.rotation.y, lRy, k);
+    if (this.attackAnim <= 0) {
+      r.torso.rotation.x = lerp(r.torso.rotation.x, torsoX, k);
+      r.torso.rotation.y = lerp(r.torso.rotation.y, torsoY, k);
+    }
+    r.head.rotation.x = lerp(r.head.rotation.x, headX, k);
+    void rootBob;
   }
 
   private setLine(line: THREE.Line, a: THREE.Vector3, b: THREE.Vector3) {
-    const attr = line.geometry.getAttribute("position") as THREE.BufferAttribute;
+    const attr = line.geometry.attributes.position as THREE.BufferAttribute;
     attr.setXYZ(0, a.x, a.y, a.z);
     attr.setXYZ(1, b.x, b.y, b.z);
     attr.needsUpdate = true;
+    line.computeLineDistances();
   }
 
+  /* ---------------- camera ---------------- */
   private updateCamera(dt: number, speed: number) {
     const cp = Math.cos(this.pitch);
     const f3 = _f.set(-Math.sin(this.yaw) * cp, Math.sin(this.pitch), -Math.cos(this.yaw) * cp);
     const right = _t.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
 
-    // look target: lead with horizontal velocity so you see where you're going,
-    // and lean slightly toward the web anchor to frame the swing arc
     const look = _d.set(
       this.pos.x + THREE.MathUtils.clamp(this.vel.x * 0.16, -6, 6),
       this.pos.y + 1.6,
@@ -2421,28 +2318,15 @@ export class Engine {
       look.y += (this.anchor.y - this.pos.y) * 0.05;
       look.z += (this.anchor.z - this.pos.z) * 0.09;
     }
-
-    // slide duck-cam & glide pull-back smoothing
-    this.camSlide += ((this.sliding ? 1 : 0) - this.camSlide) * (1 - Math.exp(-10 * dt));
-    this.camGlide += ((this.gliding ? 1 : 0) - this.camGlide) * (1 - Math.exp(-8 * dt));
-    look.y -= this.camSlide * 0.55;
-
     this.camLook.lerp(look, 1 - Math.exp(-10 * dt));
 
-    // distance: pulls back as you speed up for a wider, faster frame
-    const distT =
-      THREE.MathUtils.clamp(8.8 + speed * 0.09, 8.8, 15.5) +
-      (this.attached ? 0.7 : 0) -
-      this.camSlide * 1.2 +
-      this.camGlide * 1.1;
+    const distT = THREE.MathUtils.clamp(8.8 + speed * 0.09, 8.8, 15.5) + (this.attached ? 0.7 : 0);
     this.camDist += (distT - this.camDist) * (1 - Math.exp(-5 * dt));
 
-    // ideal position behind the look target; looking up sinks it, looking down lifts it
     const ideal = _u.copy(this.camLook).addScaledVector(f3, -this.camDist);
     ideal.y -= Math.sin(this.pitch) * this.camDist * 0.38;
     ideal.y = Math.max(ideal.y, 0.85);
 
-    // never clip through the city: sweep a ray toward the ideal point
     const dir = _r.subVectors(ideal, this.camLook);
     const rayLen = dir.length();
     if (rayLen > 0.001) {
@@ -2461,7 +2345,6 @@ export class Engine {
       ideal.copy(this.camLook).addScaledVector(dir, Math.max(2.2, tMin - 0.55));
     }
 
-    // follow: snap in fast when a wall pushes us, glide otherwise
     const dIdeal = ideal.distanceToSquared(this.camLook);
     const dCur = this.camera.position.distanceToSquared(this.camLook);
     this.camera.position.lerp(ideal, 1 - Math.exp((dIdeal < dCur ? -30 : -12) * dt));
@@ -2472,7 +2355,6 @@ export class Engine {
       this.shake *= Math.exp(-6 * dt);
     }
 
-    // bank into turns while airborne
     const sideVel = this.vel.x * right.x + this.vel.z * right.z;
     const rollT = this.grounded ? 0 : THREE.MathUtils.clamp(-sideVel * 0.011, -0.16, 0.16);
     this.camRoll += (rollT - this.camRoll) * (1 - Math.exp(-6 * dt));
@@ -2480,321 +2362,41 @@ export class Engine {
     this.camera.lookAt(this.camLook);
     if (Math.abs(this.camRoll) > 0.001) this.camera.rotateZ(this.camRoll);
 
-    // FOV: speed rush + thwip punch-in / release punch-out
     this.fovPunch *= Math.exp(-7 * dt);
-    const targetFov =
-      72 + Math.min(26, Math.max(0, speed - 10) * 0.62) + (this.attached ? 2 : 0) - this.camGlide * 3 + this.fovPunch;
+    const targetFov = 72 + Math.min(26, Math.max(0, speed - 10) * 0.62) + (this.attached ? 2 : 0) + this.fovPunch;
     this.fov += (targetFov - this.fov) * (1 - Math.exp(-6 * dt));
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
   }
 
-  /* ---------------- multiplayer ---------------- */
-  joinRoom(code: string, name: string) {
-    this.leaveRoom();
-    this.roomCode = code.toUpperCase().trim();
-    this.netName = (name.trim() || "SPIDER").slice(0, 12).toUpperCase();
-    const palette = ["#52ffa8", "#ff4fd8", "#ffcf3f", "#aef3ff", "#ff9d2e", "#c084fc"];
-    let h = 0;
-    for (const ch of this.pid) h = (h * 33 + ch.charCodeAt(0)) | 0;
-    this.netColor = palette[Math.abs(h) % palette.length];
-    this.transport = createRoomTransport(this.roomCode, this.pid, (kind) =>
-      this.cbs.onNetStatus(kind === "supabase" ? "online" : "local")
-    );
-    this.transport.onPacket((p) => this.handlePacket(p));
-    this.cbs.onNetStatus(this.transport.kind === "supabase" ? "online" : "local");
-  }
-
-  leaveRoom() {
-    if (this.transport) {
-      this.transport.close();
-      this.transport = null;
-    }
-    this.roomCode = null;
-    const pids: string[] = [];
-    this.ghosts.forEach((_, pid) => pids.push(pid));
-    pids.forEach((pid) => this.removeGhost(pid));
-    this.rosterCache = [];
-    this.cbs.onRoster([]);
-    this.cbs.onNetStatus("off");
-  }
-
-  get transportKind() {
-    return this.transport?.kind ?? null;
-  }
-
-  private sendNet() {
-    if (!this.transport) return;
-    this.transport.send({
-      v: 1,
-      pid: this.pid,
-      name: this.netName,
-      color: this.netColor,
-      x: this.pos.x,
-      y: this.pos.y,
-      z: this.pos.z,
-      vx: this.vel.x,
-      vy: this.vel.y,
-      vz: this.vel.z,
-      yaw: this.yaw,
-      attached: this.attached,
-      ax: this.anchor.x,
-      ay: this.anchor.y,
-      az: this.anchor.z,
-      grounded: this.grounded,
-      score: this.score,
-      combo: this.combo,
-      tokens: this.collected,
-      playing: this.phase === "playing",
-    });
-  }
-
-  private handlePacket(p: NetPacket) {
-    let g = this.ghosts.get(p.pid);
-    if (!g) {
-      g = this.createGhost(p);
-      this.ghosts.set(p.pid, g);
-    }
-    g.lastSeen = this.elapsed;
-    g.name = p.name;
-    g.color = p.color;
-    g.target.set(p.x, p.y, p.z);
-    g.vel.set(p.vx, p.vy, p.vz);
-    g.yaw = p.yaw;
-    g.attached = p.attached;
-    g.anchor.set(p.ax, p.ay, p.az);
-    g.grounded = p.grounded;
-    g.score = p.score;
-    g.combo = p.combo;
-    g.tokens = p.tokens;
-  }
-
-  private standingsList(): Standing[] {
-    const list: Standing[] = [
-      { pid: this.pid, name: this.netName, color: "#ff2438", score: this.score, tokens: this.collected, you: true },
-    ];
-    this.ghosts.forEach((g) =>
-      list.push({ pid: g.pid, name: g.name, color: g.color, score: g.score, tokens: g.tokens, you: false })
-    );
-    return list.sort((a, b) => b.score - a.score).slice(0, 8);
-  }
-
-  private makeTag(name: string, color: string): THREE.Sprite {
-    const cv = document.createElement("canvas");
-    cv.width = 256;
-    cv.height = 72;
-    const c = cv.getContext("2d")!;
-    c.fillStyle = "rgba(6,9,26,0.78)";
-    c.fillRect(0, 10, 256, 52);
-    c.fillStyle = color;
-    c.fillRect(0, 58, 256, 4);
-    c.font = "700 30px 'Chakra Petch', 'Segoe UI', sans-serif";
-    c.textAlign = "center";
-    c.textBaseline = "middle";
-    c.fillStyle = "#ffffff";
-    c.fillText(name.slice(0, 12), 128, 37);
-    const tex = new THREE.CanvasTexture(cv);
-    const sprite = new THREE.Sprite(
-      new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false })
-    );
-    sprite.scale.set(4.6, 1.29, 1);
-    sprite.renderOrder = 999;
-    return sprite;
-  }
-
-  private createGhost(p: NetPacket): Ghost {
-    const col = new THREE.Color(p.color || "#52ffa8");
-    const rig = buildR6Rig({
-      head: col.getHex(),
-      torso: col.clone().multiplyScalar(0.75).getHex(),
-      arms: col.clone().multiplyScalar(0.55).getHex(),
-      legs: col.clone().multiplyScalar(0.55).getHex(),
-    });
-    rig.group.traverse((o) => {
-      const mesh = o as THREE.Mesh;
-      if (mesh.isMesh) {
-        const m = mesh.material as THREE.MeshToonMaterial;
-        m.transparent = true;
-        m.opacity = 0.92;
-        m.emissive = col.clone().multiplyScalar(0.22);
-      }
-    });
-    this.scene.add(rig.group);
-
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3).setUsage(THREE.DynamicDrawUsage));
-    const webLine = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: col.getHex(), transparent: true, opacity: 0.8 }));
-    webLine.frustumCulled = false;
-    webLine.visible = false;
-    this.scene.add(webLine);
-
-    const tag = this.makeTag(p.name, p.color);
-    this.scene.add(tag);
-
-    const glowSprite = new THREE.Sprite(
-      new THREE.SpriteMaterial({
-        map: this.glowTex,
-        color: col.getHex(),
-        transparent: true,
-        opacity: 0.3,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      })
-    );
-    glowSprite.scale.setScalar(5);
-    this.scene.add(glowSprite);
-
-    return {
-      ...rig,
-      pid: p.pid,
-      name: p.name,
-      color: p.color,
-      pos: new THREE.Vector3(p.x, p.y, p.z),
-      target: new THREE.Vector3(p.x, p.y, p.z),
-      vel: new THREE.Vector3(p.vx, p.vy, p.vz),
-      yaw: p.yaw,
-      attached: p.attached,
-      anchor: new THREE.Vector3(p.ax, p.ay, p.az),
-      grounded: p.grounded,
-      score: p.score,
-      combo: p.combo,
-      tokens: p.tokens,
-      lastSeen: this.elapsed,
-      webLine,
-      tag,
-      glowSprite,
-      fade: 0,
-    };
-  }
-
-  private removeGhost(pid: string) {
-    const g = this.ghosts.get(pid);
-    if (!g) return;
-    this.scene.remove(g.group, g.webLine, g.tag, g.glowSprite);
-    g.group.traverse((o) => {
-      const mesh = o as THREE.Mesh;
-      if (mesh.isMesh) {
-        mesh.geometry.dispose();
-        const m = mesh.material as THREE.MeshToonMaterial;
-        m.gradientMap?.dispose();
-        m.dispose();
-      }
-    });
-    g.webLine.geometry.dispose();
-    (g.webLine.material as THREE.Material).dispose();
-    (g.tag.material as THREE.SpriteMaterial).map?.dispose();
-    (g.tag.material as THREE.Material).dispose();
-    (g.glowSprite.material as THREE.Material).dispose();
-    this.ghosts.delete(pid);
-  }
-
-  private pruneGhosts() {
-    const stale: string[] = [];
-    this.ghosts.forEach((g, pid) => {
-      if (this.elapsed - g.lastSeen > 4) stale.push(pid);
-    });
-    stale.forEach((pid) => this.removeGhost(pid));
-  }
-
-  private updateGhosts(dt: number) {
-    const k = 1 - Math.exp(-16 * dt);
-    const kf = 1 - Math.exp(-13 * dt);
-    this.ghosts.forEach((g) => {
-      g.fade = Math.min(1, g.fade + dt * 2.5);
-      g.pos.lerp(g.target, k);
-      if (g.pos.y < 0.6) g.pos.y = 0.6;
-      g.group.position.set(g.pos.x, g.pos.y - R, g.pos.z);
-      g.group.scale.setScalar(0.4 + 0.6 * g.fade);
-
-      const hs = Math.hypot(g.vel.x, g.vel.z);
-      if (hs > 2.5) {
-        const ty = Math.atan2(g.vel.x, g.vel.z);
-        let dy = ty - g.group.rotation.y;
-        while (dy > Math.PI) dy -= Math.PI * 2;
-        while (dy < -Math.PI) dy += Math.PI * 2;
-        g.group.rotation.y += dy * kf;
-      }
-      this.applyPose(g, { hs, velY: g.vel.y, grounded: g.grounded, attached: g.attached, k: kf, gait: this.elapsed * 11 });
-
-      if (g.attached) {
-        _v.set(g.pos.x, g.pos.y + 0.55, g.pos.z);
-        this.setLine(g.webLine, _v, g.anchor);
-        g.webLine.visible = true;
-      } else {
-        g.webLine.visible = false;
-      }
-
-      g.tag.position.set(g.pos.x, g.pos.y + 1.6, g.pos.z);
-      (g.tag.material as THREE.SpriteMaterial).opacity = 0.9 * g.fade;
-      g.glowSprite.position.set(g.pos.x, g.pos.y - 0.25, g.pos.z);
-      (g.glowSprite.material as THREE.SpriteMaterial).opacity = 0.3 * g.fade;
-    });
-  }
-
-  /* ---------------- scoring ---------------- */
-  private collectToken(t: Token) {
-    t.active = false;
-    t.group.visible = false;
-    t.respawn = 2.6;
-    this.collected++;
-    this.missionInc("tokens", 1);
-    const mult = Math.max(1, this.combo);
-    const val = 100 * mult;
-    this.score += val;
-    this.sfx.collect(this.combo);
-    this.particles.burst(t.group.position, 26, ["#ffcf3f", "#ffe9a0", "#ff9d2e", "#ffffff"], 10, 0.8, 4);
-    this.popupAt(t.group.position.clone(), `+${val}`, "gold");
-    if (this.collected >= GOAL && this.mode === "solo") this.endRun(true);
-  }
-
-  private respawnToken(t: Token) {
-    const streets = [-224, -160, -96, -32, 32, 96, 160, 224];
-    const vertical = Math.random() < 0.5;
-    const street = streets[Math.floor(Math.random() * streets.length)];
-    const along = (Math.random() * 2 - 1) * 230;
-    const y = 13 + Math.random() * 30;
-    const p = vertical
-      ? new THREE.Vector3(street + (Math.random() - 0.5) * 6, y, along)
-      : new THREE.Vector3(along, y, street + (Math.random() - 0.5) * 6);
-    if (p.distanceToSquared(this.pos) < 26 * 26) {
-      t.respawn = 0.8;
-      return;
-    }
-    t.group.position.copy(p);
-    t.baseY = p.y;
-    t.active = true;
-    t.group.visible = true;
-    this.particles.burst(p, 10, ["#ffcf3f", "#8ae9ff"], 5, 0.5);
-  }
-
-  private endRun(goalReached: boolean) {
-    let won = goalReached;
-    if (this.mode === "versus") {
-      this.finalStandings = this.standingsList();
-      const idx = this.finalStandings.findIndex((s) => s.you);
-      this.placement = idx < 0 ? 1 : idx + 1;
-      won = this.placement === 1;
-      this.rosterCache = this.finalStandings;
-      this.cbs.onRoster(this.rosterCache);
-    } else {
-      this.placement = won ? 1 : 0;
-    }
-    if (won) this.sfx.win();
-    else this.sfx.lose();
-    this.sfx.setWind(0);
-    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
-    if (won) this.particles.burst(this.pos.clone().add(new THREE.Vector3(0, 3, 0)), 90, ["#ffcf3f", "#35e0ff", "#ff4fd8", "#ffffff"], 16, 1.4, 8);
-    this.setPhase(won ? "won" : "lost");
-    this.maybeSubmitScore();
-  }
-
-  /* ---------------- hud ---------------- */
+  /* ---------------- HUD ---------------- */
   private popupAt(worldPos: THREE.Vector3, text: string, kind: PopupData["kind"]) {
     const v = worldPos.clone().project(this.camera);
     if (v.z > 1) return;
     const x = (v.x * 0.5 + 0.5) * window.innerWidth;
     const y = (-v.y * 0.5 + 0.5) * window.innerHeight;
     this.cbs.onPopup({ id: ++this.popupId, x, y, text, kind });
+  }
+
+  private buildPowerHud(): PowerHud | null {
+    const f = this.currentPower;
+    if (!f) return null;
+    const hex = (n: number) => `#${n.toString(16).padStart(6, "0")}`;
+    return {
+      name: f.name,
+      rarity: f.rarity,
+      color: hex(f.color),
+      glow: hex(f.glow),
+      energy: Math.round(this.energy),
+      maxEnergy: this.maxEnergy,
+      moves: f.moves.map((mv) => ({
+        key: mv.key,
+        name: mv.name,
+        cd: this.powerCd[mv.key] ?? 0,
+        maxCd: mv.cd,
+        cost: this.moveCost(mv),
+      })),
+    };
   }
 
   private emitHud() {
@@ -2805,8 +2407,20 @@ export class Engine {
         anchor = {
           x: (v.x * 0.5 + 0.5) * window.innerWidth,
           y: (-v.y * 0.5 + 0.5) * window.innerHeight,
-          ok: true,
           sky: this.currentAnchor.sky,
+        };
+      }
+    }
+    let powerPip: HudData["powerPip"] = null;
+    const near = this.powerSpawner.nearest(this.pos);
+    if (near && near.dist > 14) {
+      const v = near.point.clone().project(this.camera);
+      if (v.z < 1) {
+        powerPip = {
+          x: THREE.MathUtils.clamp((v.x * 0.5 + 0.5) * window.innerWidth, 60, window.innerWidth - 60),
+          y: THREE.MathUtils.clamp((-v.y * 0.5 + 0.5) * window.innerHeight, 90, window.innerHeight - 140),
+          glow: `#${near.def.glow.toString(16).padStart(6, "0")}`,
+          name: near.def.name,
         };
       }
     }
@@ -2816,93 +2430,57 @@ export class Engine {
       time: Math.max(0, Math.ceil(this.time)),
       tokens: this.collected,
       tokensTotal: GOAL,
-      speed: Math.hypot(this.vel.x, this.vel.z),
+      speed: this.vel.length(),
       alt: Math.max(0, this.pos.y - R),
       attached: this.attached,
       muted: this.sfx.muted,
       anchor,
       mode: this.mode,
-      countdown: this.countdown,
-      standings: this.mode === "versus" ? this.rosterCache.slice(0, 5) : [],
-      roomCode: this.roomCode,
-      sliding: this.sliding,
-      gliding: this.gliding,
-      climbing: this.climbing,
-      dashReady: this.dashCd <= 0,
-      hp: this.hp,
+      hp: Math.round(this.hp),
+      maxHp: this.maxHp,
+      cash: this.wallet,
+      power: this.buildPowerHud(),
+      powerPip,
+      dealerNear: this.nearDealerIdx >= 0 ? DEALERS[this.nearDealerIdx].name : null,
       punchCombo: this.comboCount,
-      mission: this.buildMissionHud(),
     });
   }
 
-  private buildMissionHud(): MissionHud | null {
-    const m = this.currentMission();
-    if (!m) return null;
-    return {
-      chapter: m.chapter,
-      title: m.title,
-      objectives: m.objectives.map((obj) => {
-        const cur = Math.min(obj.target, this.missionProg[obj.id] ?? 0);
-        return { text: obj.text, cur, target: obj.target, done: cur >= obj.target };
-      }),
-    };
+  getWallet(): number {
+    return this.wallet;
+  }
+
+  getRarityLabel(r: Rarity): string {
+    return RARITY[r].label;
+  }
+
+  dispose() {
+    this.disposed = true;
+    cancelAnimationFrame(this.raf);
+    window.removeEventListener("resize", this.onResize);
+    window.removeEventListener("keydown", this.onKeyDown);
+    window.removeEventListener("keyup", this.onKeyUp);
+    window.removeEventListener("mousemove", this.onMouseMove);
+    window.removeEventListener("mousedown", this.onMouseDown);
+    window.removeEventListener("mouseup", this.onMouseUp);
+    this.canvas.removeEventListener("contextmenu", this.onCtx);
+    document.removeEventListener("pointerlockchange", this.onLockChange);
+    this.clearWebShots();
+    this.clearPowerProjectiles();
+    for (const fx of this.powerFx) {
+      this.scene.remove(fx.obj);
+      ((fx.obj as THREE.Mesh).material as THREE.Material).dispose();
+      (fx.obj as THREE.Mesh).geometry.dispose();
+    }
+    this.powerFx.length = 0;
+    this.powerSpawner.dispose();
+    this.crowd.dispose();
+    for (const d of this.dealerRigs) disposeRig(d.rig);
+    this.rt.dispose();
+    this.rt.depthTexture?.dispose();
+    this.postMat.dispose();
+    this.renderer.dispose();
   }
 }
 
-const _v = new THREE.Vector3();
-const _n = new THREE.Vector3();
-const _f = new THREE.Vector3();
-const _t = new THREE.Vector3();
-const _d = new THREE.Vector3();
-const _u = new THREE.Vector3();
-const _r = new THREE.Vector3();
-
-/** Nearest ray entry distance into an axis-aligned box (y from 0 to b.top). -1 if no hit. */
-function rayBoxT(o: THREE.Vector3, d: THREE.Vector3, b: Box): number {
-  let tmin = 0;
-  let tmax = Infinity;
-  if (Math.abs(d.x) < 1e-9) {
-    if (o.x < b.cx - b.hx || o.x > b.cx + b.hx) return -1;
-  } else {
-    let t1 = (b.cx - b.hx - o.x) / d.x;
-    let t2 = (b.cx + b.hx - o.x) / d.x;
-    if (t1 > t2) {
-      const s = t1;
-      t1 = t2;
-      t2 = s;
-    }
-    if (t1 > tmin) tmin = t1;
-    if (t2 < tmax) tmax = t2;
-    if (tmin > tmax) return -1;
-  }
-  const by0 = b.y0 ?? 0;
-  if (Math.abs(d.y) < 1e-9) {
-    if (o.y < by0 || o.y > b.top) return -1;
-  } else {
-    let t1 = (by0 - o.y) / d.y;
-    let t2 = (b.top - o.y) / d.y;
-    if (t1 > t2) {
-      const s = t1;
-      t1 = t2;
-      t2 = s;
-    }
-    if (t1 > tmin) tmin = t1;
-    if (t2 < tmax) tmax = t2;
-    if (tmin > tmax) return -1;
-  }
-  if (Math.abs(d.z) < 1e-9) {
-    if (o.z < b.cz - b.hz || o.z > b.cz + b.hz) return -1;
-  } else {
-    let t1 = (b.cz - b.hz - o.z) / d.z;
-    let t2 = (b.cz + b.hz - o.z) / d.z;
-    if (t1 > t2) {
-      const s = t1;
-      t1 = t2;
-      t2 = s;
-    }
-    if (t1 > tmin) tmin = t1;
-    if (t2 < tmax) tmax = t2;
-    if (tmin > tmax) return -1;
-  }
-  return tmin;
-}
+const POWERS_BY_ID = new Map<string, PowerDef>(POWERS.map((p) => [p.id, p]));

@@ -1,6 +1,6 @@
 import * as THREE from "three";
 
-/** Classic R6 blocky character rig (Roblox proportions: 5-stud figure). */
+/** Classic R6 blocky character rig (Roblox proportions). */
 export interface Rig {
   group: THREE.Group;
   head: THREE.Mesh;
@@ -18,287 +18,249 @@ export interface RigStyle {
   legs: number;
   /** lens color for the spider eyes; defaults to white */
   eye?: number;
-  /** Wrap texture applied to every head face (e.g. spider webbing). */
   headTex?: THREE.Texture | null;
-  /** Transparent face overlay applied to the FRONT head face only (civ/thug). */
-  faceTex?: THREE.Texture | null;
-  /** Wrap texture for the torso (spider webbing). */
   torsoTex?: THREE.Texture | null;
-  /** Wrap texture for the arms (spider webbing). */
   armTex?: THREE.Texture | null;
-  /** Spider: adds 3D white eye lenses + a chest emblem. */
   spider?: boolean;
+  /** small blocky hat / cap color */
+  cap?: number | null;
 }
 
-/* ---------- shared resources ---------- */
-
-const S = 0.42; // 1 stud in meters
-
-let gradientMap: THREE.DataTexture | null = null;
-function getGradient(): THREE.DataTexture {
-  if (!gradientMap) {
-    const data = new Uint8Array([70, 70, 70, 255, 140, 140, 140, 255, 255, 255, 255, 255]);
-    gradientMap = new THREE.DataTexture(data, 3, 1, THREE.RGBAFormat);
-    gradientMap.minFilter = THREE.NearestFilter;
-    gradientMap.magFilter = THREE.NearestFilter;
-    gradientMap.needsUpdate = true;
-  }
-  return gradientMap;
-}
-
-export function toonMat(color: number, map?: THREE.Texture | null, transparent = false): THREE.MeshToonMaterial {
-  return new THREE.MeshToonMaterial({
-    color,
-    map: map ?? undefined,
-    gradientMap: getGradient(),
-    transparent,
-    alphaTest: transparent ? 0.05 : 0,
-  });
-}
-
-const geoHead = new THREE.BoxGeometry(1.2 * S, 1.2 * S, 1.2 * S);
-const geoTorso = new THREE.BoxGeometry(2 * S, 2 * S, 1 * S);
-const geoArm = new THREE.BoxGeometry(1 * S, 2 * S, 1 * S);
-const geoLeg = new THREE.BoxGeometry(1 * S, 2 * S, 1 * S);
-
-/* ---------- canvas textures ---------- */
-
-function canvasTex(size: number, draw: (c: CanvasRenderingContext2D, s: number) => void): THREE.CanvasTexture {
+function canvasTex(w: number, h: number, draw: (c: CanvasRenderingContext2D) => void) {
   const cv = document.createElement("canvas");
-  cv.width = cv.height = size;
-  draw(cv.getContext("2d")!, size);
+  cv.width = w;
+  cv.height = h;
+  const c = cv.getContext("2d")!;
+  draw(c);
   const t = new THREE.CanvasTexture(cv);
   t.magFilter = THREE.NearestFilter;
-  t.anisotropy = 2;
   return t;
 }
 
-function webGrid(c: CanvasRenderingContext2D, s: number, step: number, color: string) {
-  c.strokeStyle = color;
-  c.lineWidth = Math.max(1.5, s / 72);
-  for (let i = 0; i <= s; i += step) {
-    c.beginPath();
-    c.moveTo(i, 0);
-    c.lineTo(i, s);
-    c.stroke();
-    c.beginPath();
-    c.moveTo(0, i);
-    c.lineTo(s, i);
-    c.stroke();
-  }
-}
-
-let _redWeb: THREE.Texture | null = null;
-export function redWebTex(): THREE.Texture {
-  if (_redWeb) return _redWeb;
-  _redWeb = canvasTex(128, (c, s) => {
-    c.fillStyle = "#d81f30";
-    c.fillRect(0, 0, s, s);
-    webGrid(c, s, 13, "rgba(40,4,12,0.6)");
-  });
-  return _redWeb;
-}
-
-let _blueWeb: THREE.Texture | null = null;
-export function blueWebTex(): THREE.Texture {
-  if (_blueWeb) return _blueWeb;
-  _blueWeb = canvasTex(128, (c, s) => {
-    c.fillStyle = "#2040b8";
-    c.fillRect(0, 0, s, s);
-    webGrid(c, s, 15, "rgba(6,10,40,0.55)");
-  });
-  return _blueWeb;
-}
-
-/** Transparent black spider emblem for the chest plane. */
-let _emblem: THREE.Texture | null = null;
-export function spiderEmblemTex(): THREE.Texture {
-  if (_emblem) return _emblem;
-  _emblem = canvasTex(128, (c, s) => {
-    c.clearRect(0, 0, s, s);
-    const cx = s / 2;
-    const cy = s * 0.46;
-    c.fillStyle = "#0b0e20";
-    c.strokeStyle = "#0b0e20";
-    c.lineWidth = s * 0.045;
-    c.lineCap = "round";
-    // legs
-    for (let i = 0; i < 4; i++) {
-      const a = -1.1 + i * 0.72;
-      const lx = Math.cos(a) * s * 0.3;
-      const ly = Math.sin(a) * s * 0.26 - s * 0.04;
+/** Spider mask: big white eyes + faint webbing on a red head. */
+function spiderHeadTex() {
+  return canvasTex(128, 128, (c) => {
+    c.fillStyle = "#e6273a";
+    c.fillRect(0, 0, 128, 128);
+    // webbing
+    c.strokeStyle = "rgba(60,8,16,0.55)";
+    c.lineWidth = 2;
+    for (let i = 0; i <= 8; i++) {
       c.beginPath();
-      c.moveTo(cx, cy);
-      c.quadraticCurveTo(cx + lx * 0.5, cy + ly - s * 0.1, cx + lx, cy + ly);
-      c.stroke();
-      c.beginPath();
-      c.moveTo(cx, cy);
-      c.quadraticCurveTo(cx - lx * 0.5, cy + ly - s * 0.1, cx - lx, cy + ly);
+      c.moveTo(i * 16, 0);
+      c.lineTo(i * 16, 128);
       c.stroke();
     }
-    // body + head
-    c.beginPath();
-    c.ellipse(cx, cy + s * 0.05, s * 0.09, s * 0.16, 0, 0, Math.PI * 2);
-    c.fill();
-    c.beginPath();
-    c.arc(cx, cy - s * 0.13, s * 0.07, 0, Math.PI * 2);
-    c.fill();
+    for (let j = 0; j <= 8; j++) {
+      c.beginPath();
+      c.moveTo(0, j * 16);
+      c.quadraticCurveTo(64, j * 16 - 8, 128, j * 16);
+      c.stroke();
+    }
+    // eyes (front face is the last quarter of a box UV wrap: x 96..128)
+    for (const ex of [102, 118]) {
+      c.fillStyle = "#0a0f22";
+      c.beginPath();
+      c.ellipse(ex, 56, 11, 17, ex < 110 ? -0.25 : 0.25, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = "#f6fcff";
+      c.beginPath();
+      c.ellipse(ex, 56, 8, 14, ex < 110 ? -0.25 : 0.25, 0, Math.PI * 2);
+      c.fill();
+    }
   });
-  return _emblem;
 }
 
-let _civFace: THREE.Texture | null = null;
-export function civFaceTex(): THREE.Texture {
-  if (_civFace) return _civFace;
-  _civFace = canvasTex(64, (c, s) => {
-    c.clearRect(0, 0, s, s);
-    c.fillStyle = "rgba(15,12,18,0.95)";
+/** Spider torso: blue with red chest panel + black spider emblem. */
+function spiderTorsoTex() {
+  return canvasTex(128, 128, (c) => {
+    c.fillStyle = "#2b53d9";
+    c.fillRect(0, 0, 128, 128);
+    c.fillStyle = "#e6273a";
+    c.fillRect(96, 8, 32, 40);
+    // spider emblem on front (x 96..128)
+    c.fillStyle = "#0a0f22";
     c.beginPath();
-    c.arc(s * 0.34, s * 0.42, s * 0.055, 0, Math.PI * 2);
-    c.arc(s * 0.66, s * 0.42, s * 0.055, 0, Math.PI * 2);
+    c.ellipse(112, 30, 5, 8, 0, 0, Math.PI * 2);
     c.fill();
-    c.strokeStyle = "rgba(15,12,18,0.9)";
-    c.lineWidth = s * 0.045;
+    c.beginPath();
+    c.arc(112, 19, 3.4, 0, Math.PI * 2);
+    c.fill();
+    c.strokeStyle = "#0a0f22";
+    c.lineWidth = 2.4;
     c.lineCap = "round";
-    c.beginPath();
-    c.arc(s * 0.5, s * 0.56, s * 0.16, 0.25, Math.PI - 0.25);
-    c.stroke();
+    for (const s of [-1, 1]) {
+      for (let i = 0; i < 4; i++) {
+        c.beginPath();
+        c.moveTo(112 + s * 3, 22 + i * 5);
+        c.quadraticCurveTo(112 + s * 11, 20 + i * 5, 112 + s * 13, 12 + i * 7);
+        c.stroke();
+      }
+    }
   });
-  return _civFace;
 }
 
-let _thugFace: THREE.Texture | null = null;
-export function thugFaceTex(): THREE.Texture {
-  if (_thugFace) return _thugFace;
-  _thugFace = canvasTex(64, (c, s) => {
-    c.fillStyle = "#e8e8f0";
-    c.fillRect(0, 0, s, s);
-    c.fillStyle = "#ff2438";
-    c.save();
-    c.translate(s * 0.33, s * 0.44);
-    c.rotate(0.35);
-    c.fillRect(-s * 0.11, -s * 0.035, s * 0.22, s * 0.07);
-    c.restore();
-    c.save();
-    c.translate(s * 0.67, s * 0.44);
-    c.rotate(-0.35);
-    c.fillRect(-s * 0.11, -s * 0.035, s * 0.22, s * 0.07);
-    c.restore();
-    c.strokeStyle = "#1a1020";
-    c.lineWidth = s * 0.05;
-    c.lineCap = "round";
-    c.beginPath();
-    c.arc(s * 0.5, s * 0.78, s * 0.14, Math.PI + 0.35, -0.35);
-    c.stroke();
+function spiderArmTex() {
+  return canvasTex(64, 128, (c) => {
+    c.fillStyle = "#e6273a";
+    c.fillRect(0, 0, 64, 128);
+    c.strokeStyle = "rgba(60,8,16,0.5)";
+    c.lineWidth = 2;
+    for (let j = 0; j <= 8; j++) {
+      c.beginPath();
+      c.moveTo(0, j * 16);
+      c.quadraticCurveTo(32, j * 16 - 6, 64, j * 16);
+      c.stroke();
+    }
+    c.fillStyle = "#2b53d9";
+    c.fillRect(0, 96, 64, 32);
   });
-  return _thugFace;
 }
 
-/* ---------- styles ---------- */
+/** Plain blocky face for civilians / dealers. */
+function faceTex(skin: number, smile = true) {
+  const hex = `#${skin.toString(16).padStart(6, "0")}`;
+  return canvasTex(128, 128, (c) => {
+    c.fillStyle = hex;
+    c.fillRect(0, 0, 128, 128);
+    // front face = x 96..128
+    c.fillStyle = "#171a2e";
+    c.fillRect(101, 48, 6, 12);
+    c.fillRect(117, 48, 6, 12);
+    if (smile) {
+      c.strokeStyle = "#171a2e";
+      c.lineWidth = 3;
+      c.beginPath();
+      c.arc(112, 66, 8, 0.15 * Math.PI, 0.85 * Math.PI);
+      c.stroke();
+    } else {
+      c.fillStyle = "#171a2e";
+      c.fillRect(105, 72, 14, 3);
+    }
+  });
+}
 
 export function spiderStyle(): RigStyle {
   return {
-    head: 0xffffff,
-    torso: 0xffffff,
-    arms: 0xffffff,
-    legs: 0x2743b0,
-    headTex: redWebTex(),
-    torsoTex: blueWebTex(),
-    armTex: redWebTex(),
+    head: 0xe6273a,
+    torso: 0x2b53d9,
+    arms: 0xe6273a,
+    legs: 0x2b53d9,
+    eye: 0xf6fcff,
+    headTex: spiderHeadTex(),
+    torsoTex: spiderTorsoTex(),
+    armTex: spiderArmTex(),
     spider: true,
   };
 }
 
-export function thugStyle(gang?: { torso: number; arms: number; legs: number }): RigStyle {
+const CIV_SKINS = [0xf2c99a, 0xc98e5a, 0x8a5a34, 0xf7dcc0, 0xa9713f];
+const CIV_SHIRTS = [0x3f7f5f, 0x7f4f9f, 0x9f6f2f, 0x2f6f9f, 0x9f3f4f, 0x4f4f8f, 0xb0b6cc];
+const CIV_PANTS = [0x2e3350, 0x3a3f5e, 0x27304a, 0x494f6e];
+
+export function civilianStyle(r: () => number): RigStyle {
   return {
-    head: 0xffffff,
-    torso: gang?.torso ?? 0x232733,
-    arms: gang?.arms ?? 0x2c3140,
-    legs: gang?.legs ?? 0x1b1f2b,
-    faceTex: thugFaceTex(),
+    head: CIV_SKINS[Math.floor(r() * CIV_SKINS.length)],
+    torso: CIV_SHIRTS[Math.floor(r() * CIV_SHIRTS.length)],
+    arms: CIV_SHIRTS[Math.floor(r() * CIV_SHIRTS.length)],
+    legs: CIV_PANTS[Math.floor(r() * CIV_PANTS.length)],
+    headTex: faceTex(CIV_SKINS[Math.floor(r() * CIV_SKINS.length)]),
+    cap: r() < 0.35 ? [0xff2438, 0x35e0ff, 0xffcf3f, 0x232b52][Math.floor(r() * 4)] : null,
   };
 }
 
-const CIV_TORSO = [0x3f8cff, 0xff9d2e, 0x52ffa8, 0xff4fd8, 0xffcf3f, 0x7ee0ff, 0xc084fc, 0xff6b6b];
-const CIV_LEGS = [0x2b3350, 0x3a3f55, 0x24304a, 0x4a3b52, 0x20343f];
-const CIV_SKIN = [0xffd9b0, 0xe8b48a, 0xc68b59, 0x8d5a3b, 0xf5c9a0];
-
-export function civStyle(rnd: () => number): RigStyle {
+export function thugStyle(gangColor: number): RigStyle {
   return {
-    head: CIV_SKIN[Math.floor(rnd() * CIV_SKIN.length)],
-    torso: CIV_TORSO[Math.floor(rnd() * CIV_TORSO.length)],
-    arms: CIV_SKIN[Math.floor(rnd() * CIV_SKIN.length)],
-    legs: CIV_LEGS[Math.floor(rnd() * CIV_LEGS.length)],
-    faceTex: civFaceTex(),
+    head: 0xd9b48a,
+    torso: gangColor,
+    arms: 0x33374a,
+    legs: 0x23263a,
+    headTex: faceTex(0xd9b48a, false),
+    cap: 0x11131f,
   };
-}
-
-/* ---------- builder ---------- */
-
-const eyeMat = new THREE.MeshBasicMaterial({ color: 0xf6fcff });
-const emblemGeo = new THREE.PlaneGeometry(0.62 * S * 2, 0.72 * S * 2);
-let emblemMat: THREE.MeshBasicMaterial | null = null;
-function getEmblemMat(): THREE.MeshBasicMaterial {
-  if (!emblemMat)
-    emblemMat = new THREE.MeshBasicMaterial({ map: spiderEmblemTex(), transparent: true, alphaTest: 0.1, depthWrite: false });
-  return emblemMat;
 }
 
 export function buildR6Rig(style: RigStyle): Rig {
-  const g = new THREE.Group();
+  const S = 0.42; // stud scale
+  const group = new THREE.Group();
 
-  const torsoMat = toonMat(style.torso, style.torsoTex ?? null);
-  const armMat = toonMat(style.arms, style.armTex ?? null);
-  const legMat = toonMat(style.legs);
+  const grad = (() => {
+    const data = new Uint8Array([70, 70, 70, 255, 150, 150, 150, 255, 255, 255, 255, 255]);
+    const t = new THREE.DataTexture(data, 3, 1, THREE.RGBAFormat);
+    t.minFilter = THREE.NearestFilter;
+    t.magFilter = THREE.NearestFilter;
+    t.needsUpdate = true;
+    return t;
+  })();
+  const toon = (color: number, tex: THREE.Texture | null | undefined) =>
+    new THREE.MeshToonMaterial(tex ? { color, gradientMap: grad, map: tex } : { color, gradientMap: grad });
 
-  const torso = new THREE.Mesh(geoTorso, torsoMat);
-  torso.position.y = 3 * S; // studs 2..4
+  // torso 2x2x1 studs
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(2 * S, 2 * S, 1 * S), toon(style.torso, style.torsoTex));
+  torso.position.y = 3 * S;
+  group.add(torso);
 
-  // Head: single wrap material, or a 6-material box with the face on the front (+z).
-  let head: THREE.Mesh;
-  if (style.faceTex) {
-    const base = toonMat(style.head);
-    const front = toonMat(style.head, style.faceTex, true);
-    head = new THREE.Mesh(geoHead, [base, base, base, base, front, base]);
-  } else {
-    head = new THREE.Mesh(geoHead, toonMat(style.head, style.headTex ?? null));
+  // head 1.2 studs, sits on top
+  const head = new THREE.Mesh(new THREE.BoxGeometry(1.2 * S, 1.2 * S, 1.2 * S), toon(style.head, style.headTex));
+  head.position.y = 4.6 * S;
+  group.add(head);
+
+  if (style.cap) {
+    const cap = new THREE.Mesh(new THREE.BoxGeometry(1.3 * S, 0.35 * S, 1.3 * S), toon(style.cap, null));
+    cap.position.y = 5.3 * S;
+    const brim = new THREE.Mesh(new THREE.BoxGeometry(1.2 * S, 0.12 * S, 0.55 * S), toon(style.cap, null));
+    brim.position.set(0, 5.16 * S, 0.72 * S);
+    group.add(cap, brim);
   }
-  head.position.y = 4.6 * S; // studs 4..5.2
 
-  // Spider: 3D eye lenses on the front of the mask.
+  // spider: 3D eye lenses on the front of the mask
   if (style.spider) {
     const eyeMat = new THREE.MeshBasicMaterial({ color: style.eye ?? 0xf6fcff });
     const eyeGeo = new THREE.BoxGeometry(0.34 * S, 0.62 * S, 0.06 * S);
-    const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
-    eyeL.position.set(-0.3 * S, 4.66 * S, 0.62 * S);
-    eyeL.rotation.z = 0.42;
-    const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
-    eyeR.position.set(0.3 * S, 4.66 * S, 0.62 * S);
-    eyeR.rotation.z = -0.42;
-    const emblem = new THREE.Mesh(emblemGeo, getEmblemMat());
-    emblem.position.set(0, 3.25 * S, 0.52 * S);
-    g.add(eyeL, eyeR, emblem);
+    for (const ex of [-0.26 * S, 0.26 * S]) {
+      const eye = new THREE.Mesh(eyeGeo, eyeMat);
+      eye.position.set(ex, 4.66 * S, 0.62 * S);
+      eye.rotation.z = ex < 0 ? 0.22 : -0.22;
+      group.add(eye);
+    }
   }
 
-  const limb = (geo: THREE.BoxGeometry, mat: THREE.Material) => {
+  const limb = (w: number, h: number, mat: THREE.Material, x: number, y: number) => {
     const pivot = new THREE.Group();
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.y = -S; // hang one limb-length below the pivot
+    pivot.position.set(x, y, 0);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, w), mat);
+    mesh.position.y = -h / 2;
     pivot.add(mesh);
+    group.add(pivot);
     return pivot;
   };
 
-  const armL = limb(geoArm, armMat);
-  armL.position.set(-1.5 * S, 4 * S, 0);
-  const armR = limb(geoArm, armMat);
-  armR.position.set(1.5 * S, 4 * S, 0);
-  const legL = limb(geoLeg, legMat);
-  legL.position.set(-0.5 * S, 2 * S, 0);
-  const legR = limb(geoLeg, legMat);
-  legR.position.set(0.5 * S, 2 * S, 0);
+  const armMat = toon(style.arms, style.armTex);
+  const legMat = toon(style.legs, null);
+  const armL = limb(1 * S, 2 * S, armMat, -1.5 * S, 4 * S);
+  const armR = limb(1 * S, 2 * S, armMat, 1.5 * S, 4 * S);
+  const legL = limb(1 * S, 2 * S, legMat, -0.5 * S, 2 * S);
+  const legR = limb(1 * S, 2 * S, legMat, 0.5 * S, 2 * S);
 
-  g.add(torso, head, armL, armR, legL, legR);
-  return { group: g, head, torso, armL, armR, legL, legR };
+  // blocky shoes
+  const shoeMat = toon(0x171a2e, null);
+  for (const leg of [legL, legR]) {
+    const shoe = new THREE.Mesh(new THREE.BoxGeometry(1.05 * S, 0.4 * S, 1.35 * S), shoeMat);
+    shoe.position.set(0, -1.95 * S, 0.12 * S);
+    leg.add(shoe);
+  }
+
+  return { group, head, torso, armL, armR, legL, legR };
 }
 
-export const R6_HEIGHT = 5.2 * S; // ~2.18 m
+export function disposeRig(rig: Rig) {
+  rig.group.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (mesh.isMesh) {
+      mesh.geometry.dispose();
+      const mmt = mesh.material;
+      if (Array.isArray(mmt)) mmt.forEach((x) => x.dispose());
+      else (mmt as THREE.Material).dispose();
+    }
+  });
+}
